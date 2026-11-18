@@ -1,0 +1,9 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Model weights (downloaded separately; see README)
+models/**/*.onnx
+*.pth
+*.safetensors

@@ -1,0 +1,5 @@
+onnxruntime-gpu   # or onnxruntime for CPU only
+numpy
+pillow
+etcpak            # BC7 encoder
+rapidocr          # text detection (OCR); uses the onnxruntime above
