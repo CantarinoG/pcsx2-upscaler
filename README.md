@@ -8,6 +8,8 @@ Upscales a PCSX2 game's dumped textures 4x with ONNX models and writes them as B
                                      └─ no text ──► other model ─┘
 ```
 
+![Before and after: a graffiti-covered wall, a logo and a brick facade from Need for Speed: Underground](docs/comparison.jpg)
+
 ## How it works
 
 - **Only what's missing:** a dump counts as replaced if a file with the same name (any extension) exists anywhere under `replacements/`, including texture-pack subfolders. Downloaded packs are never overwritten, and an interrupted run continues where it stopped.
