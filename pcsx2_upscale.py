@@ -8,6 +8,9 @@ replacements/, including texture-pack subfolders, so downloaded packs are never 
 
 Textures with readable text (signs, logos, UI) go through TEXT_MODEL; everything else through OTHER_MODEL.
 
+Textures listed in <textures>/<GAME>/skip.txt are never upscaled, and any replacement for them under
+replacements/ (including texture-pack subfolders) is deleted, so the game shows the original.
+
 Usage: pcsx2_upscale.py [textures_dir]      (default: ~/.config/PCSX2/textures)
 """
 import argparse
@@ -33,6 +36,7 @@ TEXT_MODEL = MODELS_DIR / "text.onnx"   # keeps lettering legible
 OTHER_MODEL = MODELS_DIR / "other.onnx"  # materials, images, foliage, ...
 DEFAULT_TEXTURES = Path.home() / ".config" / "PCSX2" / "textures"
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".dds")
+SKIP_FILE = "skip.txt"  # per game: textures to leave unreplaced, one name per line
 DDS_WORKERS = max(1, min(4, (os.cpu_count() or 2) // 2))  # BC7 encoding is CPU-bound and single-threaded
 
 MIN_SIDE = 64          # some models fail on tiny inputs; smaller images are wrap-padded up to this
@@ -167,6 +171,33 @@ def load_game_titles(textures: Path) -> dict[str, str]:
     return titles
 
 
+def load_skip_list(game: Path) -> set[str]:
+    """Texture names (hash, file name or path; any extension) listed in <game>/skip.txt. '#' starts a comment."""
+    path = game / SKIP_FILE
+    if not path.is_file():
+        return set()
+    names = set()
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            name = Path(line).name
+            names.add(Path(name).stem if Path(name).suffix.lower() in IMAGE_EXTS else name)
+    return names
+
+
+def remove_skipped(repl_dir: Path, skip: set[str]) -> int:
+    """Deletes replacements of skipped textures, wherever they are under replacements/."""
+    if not skip or not repl_dir.is_dir():
+        return 0
+    removed = 0
+    for p in sorted(repl_dir.rglob("*")):
+        if p.is_file() and p.stem in skip:
+            p.unlink()
+            removed += 1
+            print(f"  removed {p.relative_to(repl_dir)}")
+    return removed
+
+
 def choose(prompt: str, options: list[str]) -> int:
     for i, opt in enumerate(options, 1):
         print(f"  {i}) {opt}")
@@ -200,11 +231,18 @@ def main():
     if not dumps_dir.is_dir():
         sys.exit(f"{game.name} has no dumps folder.")
 
+    skip = load_skip_list(game)
+    if skip:
+        print(f"\n{SKIP_FILE}: {len(skip)} textures to leave unreplaced.")
+        if n := remove_skipped(repl_dir, skip):
+            print(f"Removed {n} replacements of skipped textures.")
+
     dumps = sorted(p for p in dumps_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
     replaced = {p.stem for p in repl_dir.rglob("*") if p.is_file()} if repl_dir.is_dir() else set()
-    todo = [p for p in dumps if p.stem not in replaced]
-    print(f"\n{titles.get(game.name, game.name)}: {len(dumps)} dumps, {len(dumps) - len(todo)} already replaced, "
-          f"{len(todo)} to upscale.")
+    skipped = [p for p in dumps if p.stem in skip]
+    todo = [p for p in dumps if p.stem not in replaced and p.stem not in skip]
+    print(f"\n{titles.get(game.name, game.name)}: {len(dumps)} dumps, {len(dumps) - len(todo) - len(skipped)} already "
+          f"replaced, {len(skipped)} skipped, {len(todo)} to upscale.")
     if not todo:
         return
 

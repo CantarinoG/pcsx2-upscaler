@@ -11,6 +11,7 @@ Upscales a PCSX2 game's dumped textures 4x with ONNX models and writes them as B
 ## How it works
 
 - **Only what's missing:** a dump counts as replaced if a file with the same name (any extension) exists anywhere under `replacements/`, including texture-pack subfolders. Downloaded packs are never overwritten, and an interrupted run continues where it stopped.
+- **Skip list:** textures named in `<textures>/<GAME>/skip.txt` are never upscaled, and any existing replacement for them under `replacements/` (pack subfolders included) is deleted on each run, so the game shows the original texture.
 - **Text detection:** OCR (RapidOCR with PP-OCRv4, Latin and Chinese) runs on each texture first. A texture counts as text when OCR reads at least 2 characters with confidence ≥ 0.5. On 229 hand-labelled dumps this gave 89% precision and 98% recall; the old "detected text area" approach peaked at about 63% / 81%. The rule favours recall because the non-text model garbles lettering, while the text model handles any texture well. It runs on the GPU at about 75 ms per texture.
 - **Seamless tiling:** each texture is padded with its own opposite edges before upscaling, so repeating ground and wall textures don't show seams.
 - **PS2 alpha:** transparency runs 0–128 on the PS2 (128 = opaque). It stays within each dump's own range:
@@ -46,6 +47,18 @@ In PCSX2, under **Settings → Graphics → Texture Replacement**:
 ```
 
 Pick a game from the list (names come from PCSX2's game list). The script first sorts every dump without a replacement into text and non-text, then upscales each group with its model.
+
+### Leaving textures unreplaced
+
+Create `<textures>/<GAME>/skip.txt` with one texture per line. Each line can be the hash, the file name (any extension) or a full path; `#` starts a comment:
+
+```
+# blurry HUD font, the original looks better
+1a5f3316f752e298-2838fc9f5ff51c7c-000059d3
+replacements/pack/1a8dd21b75996f4a-8b1fe45826ac4020-00005194.dds
+```
+
+On the next run those textures are skipped, and their existing replacements are deleted, including ones from downloaded packs.
 
 ## Files
 
