@@ -23,11 +23,10 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from pcsx2_upscale import DEFAULT_TEXTURES, IMAGE_EXTS, choose, load_game_titles, load_skip_list
+from pcsx2_upscale import DEFAULT_TEXTURES, IMAGE_EXTS, USAGE_CACHE, USAGE_FILE, choose, load_game_titles, load_skip_list
 
 ROOT = Path(__file__).resolve().parent
-CACHE = Path.home() / ".cache" / "pcsx2-upscaler"
-USAGE_FILE = "usage.json"
+CACHE = USAGE_CACHE.parent
 
 # Bytes per 4x4 block of the compressed formats a .dds replacement can use
 DXGI_BLOCK = {71: 8, 72: 8, 74: 16, 75: 16, 77: 16, 78: 16, 80: 8, 81: 8, 83: 16, 84: 16, 95: 16, 96: 16, 98: 16, 99: 16}

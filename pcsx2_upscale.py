@@ -11,13 +11,18 @@ Textures with readable text (signs, logos, UI) go through TEXT_MODEL; everything
 Textures listed in <textures>/<GAME>/skip.txt are never upscaled, and any replacement for them under
 replacements/ (including texture-pack subfolders) is deleted, so the game shows the original.
 
+If texture_usage.py has measured the game (<textures>/<GAME>/usage.json), textures drawn in at least half of the
+sampled frames whose replacement is still 512 px or smaller get a second 4x pass (16x the dump in total).
+
 Usage: pcsx2_upscale.py [textures_dir]      (default: ~/.config/PCSX2/textures)
 """
 import argparse
 import gc
+import json
 import multiprocessing
 import os
 import re
+import struct
 import sys
 import time
 from concurrent.futures import Future, ProcessPoolExecutor
@@ -37,6 +42,10 @@ OTHER_MODEL = MODELS_DIR / "other.onnx"  # materials, images, foliage, ...
 DEFAULT_TEXTURES = Path.home() / ".config" / "PCSX2" / "textures"
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".dds")
 SKIP_FILE = "skip.txt"  # per game: textures to leave unreplaced, one name per line
+USAGE_FILE = "usage.json"  # per game: how often each texture is drawn, written by texture_usage.py
+USAGE_CACHE = Path.home() / ".cache" / "pcsx2-upscaler" / "usage"
+BOOST_MIN_FRAMES = 0.5  # textures drawn in at least this share of sampled frames...
+BOOST_MAX_SIDE = 512    # ...whose 4x replacement is at most this big get a second 4x pass
 DDS_WORKERS = max(1, min(4, (os.cpu_count() or 2) // 2))  # BC7 encoding is CPU-bound and single-threaded
 
 MIN_SIDE = 64          # some models fail on tiny inputs; smaller images are wrap-padded up to this
@@ -222,6 +231,49 @@ def remove_skipped(repl_dir: Path, skip: set[str]) -> int:
     return removed
 
 
+def dds_size(path: Path) -> tuple[int, int]:
+    with open(path, "rb") as f:
+        h, w = struct.unpack_from("<II", f.read(20), 12)
+    return w, h
+
+
+def textures_to_boost(game: Path, dumps: list[Path], repl_dir: Path, skip: set[str]) -> list[Path]:
+    """Dumps of frequently drawn textures whose replacement is still a single 4x pass of at most BOOST_MAX_SIDE.
+
+    Frequency comes from usage.json (texture_usage.py). Only this script's own replacements (replacements/<name>.dds)
+    are redone, never pack files. A replacement already 16x its dump is done, so later runs leave it alone."""
+    try:
+        usage = json.loads((game / USAGE_FILE).read_text())
+    except (OSError, ValueError):
+        return []
+    frames = usage.get("captures", 0)
+    if not frames:
+        return []
+    try:  # names with identical content are counted under the first one; boost them all
+        index = json.loads((USAGE_CACHE / game.name / "index.json").read_text())
+        aliases = {names[0]: names for names in index["hashes"].values()}
+    except (OSError, ValueError, KeyError):
+        aliases = {}
+    by_stem = {p.stem: p for p in dumps}
+    out = []
+    for name, t in usage.get("textures", {}).items():
+        if t["frames"] / frames < BOOST_MIN_FRAMES:
+            continue
+        for alias in aliases.get(name, [name]):
+            src, repl = by_stem.get(alias), repl_dir / f"{alias}.dds"
+            if alias in skip or src is None or not repl.is_file():
+                continue
+            try:
+                w, h = dds_size(repl)
+                with Image.open(src) as im:
+                    sw, sh = im.size
+            except Exception:
+                continue
+            if max(w, h) <= BOOST_MAX_SIDE and (w, h) == (sw * 4, sh * 4):
+                out.append(src)
+    return sorted(set(out))
+
+
 def choose(prompt: str, options: list[str]) -> int:
     for i, opt in enumerate(options, 1):
         print(f"  {i}) {opt}")
@@ -264,9 +316,14 @@ def main():
     dumps = sorted(p for p in dumps_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
     replaced = {p.stem for p in repl_dir.rglob("*") if p.is_file()} if repl_dir.is_dir() else set()
     skipped = [p for p in dumps if p.stem in skip]
-    todo = [p for p in dumps if p.stem not in replaced and p.stem not in skip]
-    print(f"\n{titles.get(game.name, game.name)}: {len(dumps)} dumps, {len(dumps) - len(todo) - len(skipped)} already "
-          f"replaced, {len(skipped)} skipped, {len(todo)} to upscale.")
+    new = [p for p in dumps if p.stem not in replaced and p.stem not in skip]
+    boost = textures_to_boost(game, dumps, repl_dir, skip)
+    print(f"\n{titles.get(game.name, game.name)}: {len(dumps)} dumps, {len(dumps) - len(new) - len(skipped)} already "
+          f"replaced, {len(skipped)} skipped, {len(new)} to upscale.")
+    if boost:
+        print(f"{USAGE_FILE}: {len(boost)} frequently used textures get a second 4x pass (16x).")
+    todo = new + boost
+    boosted = set(boost)
     if not todo:
         return
 
@@ -324,6 +381,8 @@ def main():
                     with Image.open(src) as im:
                         im.load()
                         up = upscaler.upscale_image(im)
+                        if src in boosted:
+                            up = upscaler.upscale_image(up)
                 except Exception as e:
                     failed += 1
                     print(f"  [{n}/{len(todo)}] {src.name}  FAILED: {type(e).__name__}: {e}")
@@ -331,7 +390,7 @@ def main():
                 pending[pool.submit(dds.save_dds, up, repl_dir / f"{src.stem}.dds")] = src
                 drain(block=False)
                 print(f"  [{n}/{len(todo)}] {src.name}  {im.width}x{im.height} -> {up.width}x{up.height}  "
-                      f"{(time.perf_counter() - t0) * 1000:.0f} ms")
+                      f"{(time.perf_counter() - t0) * 1000:.0f} ms" + ("  (2nd pass)" if src in boosted else ""))
             del upscaler
             gc.collect()  # free its GPU memory before the next model loads
         if pending:

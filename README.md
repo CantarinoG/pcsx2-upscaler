@@ -14,6 +14,7 @@ Upscales a PCSX2 game's dumped textures 4x with ONNX models and writes them as B
 
 - **Only what's missing:** a dump counts as replaced if a file with the same name (any extension) exists anywhere under `replacements/`, including texture-pack subfolders. Downloaded packs are never overwritten, and an interrupted run continues where it stopped.
 - **Skip list:** textures named in `<textures>/<GAME>/skip.txt` are never upscaled, and any existing replacement for them under `replacements/` (pack subfolders included) is deleted on each run, so the game shows the original texture.
+- **Second pass for frequent textures:** if the game has been measured with `texture_usage.py` (see below), textures drawn in at least 50% of the sampled frames whose replacement is still 512 px or smaller are upscaled 4x again, to 16x the dump. Only this script's own replacements are redone, never pack files, and a texture already at 16x is left alone on later runs. The thresholds are `BOOST_MIN_FRAMES` and `BOOST_MAX_SIDE` at the top of `pcsx2_upscale.py`.
 - **Text detection:** OCR (RapidOCR with PP-OCRv4, Latin and Chinese) runs on each texture first. A texture counts as text when OCR reads at least 2 characters with confidence ≥ 0.5. On 229 hand-labelled dumps this gave 89% precision and 98% recall; the old "detected text area" approach peaked at about 63% / 81%. The rule favours recall because the non-text model garbles lettering, while the text model handles any texture well. It runs on the GPU at about 75 ms per texture.
 - **Edges:** each texture is padded before upscaling. If its opposite edges match (repeating ground and wall textures), it's padded with them, so the upscale tiles without seams. Otherwise (gradients, shadows, UI bars) it's mirrored, so one edge doesn't bleed into the other.
 - **PS2 alpha:** transparency runs 0–128 on the PS2 (128 = opaque). It stays within each dump's own range:
@@ -85,6 +86,7 @@ in frames  draws/frame  status    texture
 
 - **in frames:** share of sampled frames that used the texture. **draws/frame:** how many times it was drawn in those frames.
 - Textures are recognised by content: a replacement by its `.dds` data, a texture without one by its dump. Variants with identical content (same texture, different palette hash) are counted together.
+- The upscaler reads these counts to give frequently drawn textures a second pass (see "How it works").
 - Counts add up across sessions in `<textures>/<GAME>/usage.json`. `--reset` starts over, `--report` only prints the report.
 - PCSX2 runs under X11 (XWayland) for this, since RenderDoc can't capture Wayland windows. An AppImage is extracted once to `~/.cache/pcsx2-upscaler/pcsx2/`, because RenderDoc can't inject into the AppImage launcher.
 
