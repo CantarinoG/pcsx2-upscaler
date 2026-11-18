@@ -62,6 +62,32 @@ replacements/pack/1a8dd21b75996f4a-8b1fe45826ac4020-00005194.dds
 
 On the next run those textures are skipped, and their existing replacements are deleted, including ones from downloaded packs.
 
+## Texture usage (optional)
+
+`texture_usage.py` measures how often the game draws each texture, so you can see which replacements matter most (or which texture is behind a glitch). It samples frames with [RenderDoc](https://renderdoc.org) while you play: every 20 seconds one frame is captured (a freeze of about half a second), the textures drawn in it are counted, and the capture is deleted.
+
+Setup, once:
+1. Download the Linux tarball from [renderdoc.org/builds](https://renderdoc.org/builds) and extract it to `~/Applications/` (or pass `--renderdoc DIR`).
+2. Register its Vulkan layer for your user: `~/Applications/renderdoc_<version>/bin/renderdoccmd vulkanlayer --register --user`. It only activates in programs launched through RenderDoc.
+3. In PCSX2, set **Settings → Graphics → Renderer** to Vulkan (OpenGL also works).
+
+```bash
+.venv/bin/python texture_usage.py [textures_dir] [--pcsx2 PATH] [--interval 20] [--top 30]
+```
+
+Pick the game, then play it in the PCSX2 window that opens. Close PCSX2 to finish. Each frame shows up in the terminal as it's counted, and the report at the end lists the most-used textures:
+
+```
+in frames  draws/frame  status    texture
+     100%        110.7  replaced  c4010ca101394499-41db6a081dc88d63-00001dd3
+      67%          3.0  skipped   8fb42b62ecb75632-59e16594d3d6e113-00001dd3  (+2 identical)
+```
+
+- **in frames:** share of sampled frames that used the texture. **draws/frame:** how many times it was drawn in those frames.
+- Textures are recognised by content: a replacement by its `.dds` data, a texture without one by its dump. Variants with identical content (same texture, different palette hash) are counted together.
+- Counts add up across sessions in `<textures>/<GAME>/usage.json`. `--reset` starts over, `--report` only prints the report.
+- PCSX2 runs under X11 (XWayland) for this, since RenderDoc can't capture Wayland windows. An AppImage is extracted once to `~/.cache/pcsx2-upscaler/pcsx2/`, because RenderDoc can't inject into the AppImage launcher.
+
 ## Files
 
 | File | Purpose |
@@ -69,3 +95,5 @@ On the next run those textures are skipped, and their existing replacements are 
 | `pcsx2_upscale.py` | The whole flow: game selection, upscaling, writing replacements |
 | `textdet.py` | Text detection (OCR), decides which model a texture goes to |
 | `dds.py` | BC7 `.dds` writer with mipmaps, in the layout PCSX2's loader expects |
+| `texture_usage.py` | Texture usage sampling: indexes the textures, runs the session, prints the report |
+| `usage_agent.py` | Runs inside RenderDoc: launches PCSX2, captures frames, counts textures per frame |
