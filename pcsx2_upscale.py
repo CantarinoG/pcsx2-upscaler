@@ -40,10 +40,31 @@ SKIP_FILE = "skip.txt"  # per game: textures to leave unreplaced, one name per l
 DDS_WORKERS = max(1, min(4, (os.cpu_count() or 2) // 2))  # BC7 encoding is CPU-bound and single-threaded
 
 MIN_SIDE = 64          # some models fail on tiny inputs; smaller images are wrap-padded up to this
-WRAP_PAD = 16          # textures repeat: pad each edge with the opposite edge so upscales tile without seams
+EDGE_PAD = 16          # context added around each texture before upscaling, cropped off afterwards
 TILE_MIN = 64          # smallest tile tried after running out of GPU memory
 OVERLAP = 16           # context shared between neighbouring tiles, hides tile seams
 ALPHA_UNIFORM_SPAN = 2 # alpha this close to constant (e.g. PS2's 127..128) is resized plainly, not by the model
+
+
+def edge_modes(arr: np.ndarray) -> tuple[str, str]:
+    """np.pad mode for the (vertical, horizontal) edges of an HxWxC texture.
+
+    A texture that tiles is padded with its opposite edge, so repeated surfaces upscale without seams.
+    One that doesn't (gradients, shadows, UI bars) is mirrored instead: wrapping would bleed the far edge in,
+    e.g. a shadow that fades to transparent at the bottom would get an opaque last row.
+    It tiles along an axis when its two opposite edges differ about as much as neighbouring rows/columns do."""
+    a = arr.astype(np.float32)
+    modes = []
+    for axis in (0, 1):
+        n = a.shape[axis]
+        if n < 3:
+            modes.append("wrap")
+            continue
+        first, last = np.take(a, 0, axis), np.take(a, n - 1, axis)
+        step = np.abs(np.diff(a, axis=axis)).mean(axis=tuple(i for i in range(a.ndim) if i != axis))
+        seam = np.abs(first - last).mean()
+        modes.append("wrap" if seam <= 2 * float(np.median(step)) + 2 else "symmetric")
+    return modes[0], modes[1]
 
 
 def init_onnxruntime():
@@ -95,10 +116,12 @@ class Upscaler:
                 out[y0 * s:cy1 * s, x0 * s:cx1 * s] = up[(y0 - ty0) * s:(cy1 - ty0) * s, (x0 - tx0) * s:(cx1 - tx0) * s]
         return out
 
-    def upscale_rgb(self, rgb: np.ndarray) -> np.ndarray:
-        """Whole image first; if the GPU runs out of memory, progressively smaller tiles."""
+    def upscale_rgb(self, rgb: np.ndarray, modes: tuple[str, str]) -> np.ndarray:
+        """Whole image first; if the GPU runs out of memory, progressively smaller tiles.
+        modes: np.pad mode for the vertical and horizontal edges (see edge_modes)."""
         h, w = rgb.shape[:2]
-        padded = np.pad(rgb, ((WRAP_PAD, WRAP_PAD), (WRAP_PAD, WRAP_PAD), (0, 0)), mode="wrap")
+        padded = np.pad(rgb, ((EDGE_PAD, EDGE_PAD), (0, 0), (0, 0)), mode=modes[0])
+        padded = np.pad(padded, ((0, 0), (EDGE_PAD, EDGE_PAD), (0, 0)), mode=modes[1])
         tile = max(padded.shape[:2])
         if tile >= self.oom_side:  # this size already ran out of memory: go straight to tiles
             tile = self.oom_side // 2
@@ -113,9 +136,9 @@ class Upscaler:
                 self.oom_side = min(self.oom_side, tile)
                 tile = max(TILE_MIN, tile // 2)
         s = up.shape[0] // padded.shape[0]
-        return up[WRAP_PAD * s:(WRAP_PAD + h) * s, WRAP_PAD * s:(WRAP_PAD + w) * s]
+        return up[EDGE_PAD * s:(EDGE_PAD + h) * s, EDGE_PAD * s:(EDGE_PAD + w) * s]
 
-    def upscale_alpha(self, alpha: np.ndarray, out_hw: tuple[int, int]) -> np.ndarray:
+    def upscale_alpha(self, alpha: np.ndarray, out_hw: tuple[int, int], modes: tuple[str, str]) -> np.ndarray:
         """HxW uint8 -> out_hw uint8, never outside the source's [min, max].
 
         PS2 alpha runs 0..128 (128 = opaque; higher blends brighter), so it must not drift. The model adds
@@ -126,7 +149,7 @@ class Upscaler:
             a = np.asarray(Image.fromarray(alpha.astype(np.float32), "F").resize((ow, oh), Image.Resampling.BICUBIC))
         else:
             norm = (alpha.astype(np.float32) - amin) / (amax - amin)
-            a = amin + self.upscale_rgb(np.repeat(norm[..., None], 3, axis=2)).mean(axis=2) * (amax - amin)
+            a = amin + self.upscale_rgb(np.repeat(norm[..., None], 3, axis=2), modes).mean(axis=2) * (amax - amin)
             if a.shape != (oh, ow):
                 a = np.asarray(Image.fromarray(a, "F").resize((ow, oh), Image.Resampling.BICUBIC))
         return np.clip(np.rint(a), amin, amax).astype(np.uint8)
@@ -134,10 +157,11 @@ class Upscaler:
     def upscale_image(self, img: Image.Image) -> Image.Image:
         has_alpha = img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info)
         arr = np.asarray(img.convert("RGBA" if has_alpha else "RGB"))
-        rgb = (self.upscale_rgb(arr[..., :3].astype(np.float32) / 255.0) * 255.0 + 0.5).astype(np.uint8)
+        modes = edge_modes(arr)  # decided on colour and alpha together: a shadow is all black, only alpha fades
+        rgb = (self.upscale_rgb(arr[..., :3].astype(np.float32) / 255.0, modes) * 255.0 + 0.5).astype(np.uint8)
         if not has_alpha:
             return Image.fromarray(rgb, "RGB")
-        return Image.fromarray(np.dstack([rgb, self.upscale_alpha(arr[..., 3], rgb.shape[:2])]), "RGBA")
+        return Image.fromarray(np.dstack([rgb, self.upscale_alpha(arr[..., 3], rgb.shape[:2], modes)]), "RGBA")
 
 
 def load_game_titles(textures: Path) -> dict[str, str]:
