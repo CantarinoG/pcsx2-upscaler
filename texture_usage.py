@@ -95,14 +95,18 @@ def build_index(game: Path) -> Path:
 
     # Names with identical content (same texture, different palette hash) can't be told apart on the GPU:
     # they're counted together under the first name.
-    groups, sizes = {}, set()
+    # dims: each name's original (dump) size, which magnification is measured against.
+    groups, sizes, dims = {}, set(), {}
     for key, entry in fresh.items():
         if entry["hash"]:
             h, w, hh = entry["hash"]
             groups.setdefault(h, set()).add(Path(key).stem)
             sizes.add(f"{w}x{hh}")
+            if key.startswith("dumps"):
+                dims[Path(key).stem] = [w, hh]
     index = cache_dir / "index.json"
-    index.write_text(json.dumps({"hashes": {h: sorted(n) for h, n in groups.items()}, "sizes": sorted(sizes)}))
+    index.write_text(json.dumps({"hashes": {h: sorted(n) for h, n in groups.items()}, "sizes": sorted(sizes),
+                                 "dims": dims}))
     return index
 
 
@@ -231,13 +235,20 @@ def report(game: Path, title: str, top: int):
     except (OSError, ValueError):
         same = {}
     print(f"\n{title}: {n} frames sampled, {len(rows)} distinct textures seen.\n")
-    print(f"{'in frames':>9}  {'draws/frame':>11}  {'status':<8}  texture")
+    print(f"{'in frames':>9}  {'draws/frame':>11}  {'closest':>7}  {'status':<8}  texture")
     for name, t in rows[:top]:
         status = "skipped" if name in skip else "replaced" if name in replaced else "original"
         extra = f"  (+{same[name]} identical)" if same.get(name) else ""
-        print(f"{t['frames'] / n:>9.0%}  {t['draws'] / t['frames']:>11.1f}  {status:<8}  {name}{extra}")
+        mag = f"{t['max_mag']:.1f}x" if "max_mag" in t else "-"
+        print(f"{t['frames'] / n:>9.0%}  {t['draws'] / t['frames']:>11.1f}  {mag:>7}  {status:<8}  {name}{extra}")
     if len(rows) > top:
         print(f"... {len(rows) - top} more in {game / USAGE_FILE}")
+    close = sorted(((t["max_mag"], name) for name, t in res["textures"].items() if t.get("max_mag")), reverse=True)
+    if close:
+        print(f"\nMost magnified (closest: native screen pixels per original texel, at the closest sampled view):")
+        for mag, name in close[:min(top, 15)]:
+            status = "skipped" if name in skip else "replaced" if name in replaced else "original"
+            print(f"{mag:>8.1f}x  {status:<8}  {name}")
 
 
 def main():

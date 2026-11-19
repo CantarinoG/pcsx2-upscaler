@@ -44,8 +44,9 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".dds")
 SKIP_FILE = "skip.txt"  # per game: textures to leave unreplaced, one name per line
 USAGE_FILE = "usage.json"  # per game: how often each texture is drawn, written by texture_usage.py
 USAGE_CACHE = Path.home() / ".cache" / "pcsx2-upscaler" / "usage"
-BOOST_MIN_FRAMES = 0.5  # textures drawn in at least this share of sampled frames...
-BOOST_MAX_SIDE = 512    # ...whose 4x replacement is at most this big get a second 4x pass
+BOOST_MIN_FRAMES = 0.5  # textures drawn in at least this share of sampled frames,
+BOOST_MIN_MAG = 2.0     # or seen this magnified (native screen pixels per original texel, closest sampled view),
+BOOST_MAX_SIDE = 512    # whose 4x replacement is at most this big, get a second 4x pass
 DDS_WORKERS = max(1, min(4, (os.cpu_count() or 2) // 2))  # BC7 encoding is CPU-bound and single-threaded
 
 MIN_SIDE = 64          # some models fail on tiny inputs; smaller images are wrap-padded up to this
@@ -238,9 +239,10 @@ def dds_size(path: Path) -> tuple[int, int]:
 
 
 def textures_to_boost(game: Path, dumps: list[Path], repl_dir: Path, skip: set[str]) -> list[Path]:
-    """Dumps of frequently drawn textures whose replacement is still a single 4x pass of at most BOOST_MAX_SIDE.
+    """Dumps of frequently drawn or strongly magnified textures whose replacement is still a single 4x pass of at
+    most BOOST_MAX_SIDE.
 
-    Frequency comes from usage.json (texture_usage.py). Only this script's own replacements (replacements/<name>.dds)
+    Frequency and magnification come from usage.json (texture_usage.py). Only this script's own replacements (replacements/<name>.dds)
     are redone, never pack files. A replacement already 16x its dump is done, so later runs leave it alone."""
     try:
         usage = json.loads((game / USAGE_FILE).read_text())
@@ -257,7 +259,7 @@ def textures_to_boost(game: Path, dumps: list[Path], repl_dir: Path, skip: set[s
     by_stem = {p.stem: p for p in dumps}
     out = []
     for name, t in usage.get("textures", {}).items():
-        if t["frames"] / frames < BOOST_MIN_FRAMES:
+        if t["frames"] / frames < BOOST_MIN_FRAMES and t.get("max_mag", 0) < BOOST_MIN_MAG:
             continue
         for alias in aliases.get(name, [name]):
             src, repl = by_stem.get(alias), repl_dir / f"{alias}.dds"
@@ -321,7 +323,7 @@ def main():
     print(f"\n{titles.get(game.name, game.name)}: {len(dumps)} dumps, {len(dumps) - len(new) - len(skipped)} already "
           f"replaced, {len(skipped)} skipped, {len(new)} to upscale.")
     if boost:
-        print(f"{USAGE_FILE}: {len(boost)} frequently used textures get a second 4x pass (16x).")
+        print(f"{USAGE_FILE}: {len(boost)} frequently used or close-up textures get a second 4x pass (16x).")
     todo = new + boost
     boosted = set(boost)
     if not todo:
