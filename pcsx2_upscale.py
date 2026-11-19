@@ -11,8 +11,9 @@ Textures with readable text (signs, logos, UI) go through TEXT_MODEL; everything
 Textures listed in <textures>/<GAME>/skip.txt are never upscaled, and any replacement for them under
 replacements/ (including texture-pack subfolders) is deleted, so the game shows the original.
 
-If texture_usage.py has measured the game (<textures>/<GAME>/usage.json), textures drawn in at least half of the
-sampled frames whose replacement is still 512 px or smaller get a second 4x pass (16x the dump in total).
+If texture_usage.py has measured the game (<textures>/<GAME>/usage.json), textures seen strongly magnified get a
+second 4x pass (16x the dump in total), kept only if it visibly adds detail; 16x replacements of textures that no
+longer qualify go back to 4x. See BOOST_* below.
 
 Usage: pcsx2_upscale.py [textures_dir]      (default: ~/.config/PCSX2/textures)
 """
@@ -44,9 +45,13 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".dds")
 SKIP_FILE = "skip.txt"  # per game: textures to leave unreplaced, one name per line
 USAGE_FILE = "usage.json"  # per game: how often each texture is drawn, written by texture_usage.py
 USAGE_CACHE = Path.home() / ".cache" / "pcsx2-upscaler" / "usage"
-BOOST_MIN_FRAMES = 0.5  # textures drawn in at least this share of sampled frames,
-BOOST_MIN_MAG = 2.0     # or seen this magnified (native screen pixels per original texel, closest sampled view),
-BOOST_MAX_SIDE = 512    # whose 4x replacement is at most this big, get a second 4x pass
+# Second 4x pass (16x in total). Thresholds from a blind A/B test of 50 textures at their closest in-game view:
+# below 1.5x magnification nobody could tell 4x from 16x, between 1.5x and 3.3x it was a coin toss (and 16x text
+# sometimes looked worse), from 3.3x on 16x won 18 of 21 times and never lost.
+BOOST_MIN_MAG = 3.3     # closest sampled view: native screen pixels per original texel
+BOOST_MIN_GAIN = 3.0    # mean luminance change (0-255) 16x makes over 4x at that view; less = nothing to see
+BOOST_MAX_SIDE = 512    # only textures whose 4x replacement is at most this big
+BOOST_REJECTED = "boost_rejected.json"  # per game, in USAGE_CACHE: textures whose 16x added too little
 DDS_WORKERS = max(1, min(4, (os.cpu_count() or 2) // 2))  # BC7 encoding is CPU-bound and single-threaded
 
 MIN_SIDE = 64          # some models fail on tiny inputs; smaller images are wrap-padded up to this
@@ -238,42 +243,79 @@ def dds_size(path: Path) -> tuple[int, int]:
     return w, h
 
 
-def textures_to_boost(game: Path, dumps: list[Path], repl_dir: Path, skip: set[str]) -> list[Path]:
-    """Dumps of frequently drawn or strongly magnified textures whose replacement is still a single 4x pass of at
-    most BOOST_MAX_SIDE.
+def upscale_multiplier(textures: Path) -> float:
+    """PCSX2's internal resolution (upscale_multiplier in PCSX2.ini); 3 if it can't be read."""
+    try:
+        m = re.search(r"^upscale_multiplier\s*=\s*([\d.]+)", (textures.parent / "inis" / "PCSX2.ini").read_text(), re.M)
+        return float(m[1]) if m else 3.0
+    except OSError:
+        return 3.0
 
-    Frequency and magnification come from usage.json (texture_usage.py). Only this script's own replacements (replacements/<name>.dds)
-    are redone, never pack files. A replacement already 16x its dump is done, so later runs leave it alone."""
+
+def second_pass_gain(x4: Image.Image, x16: Image.Image, scale: float) -> float:
+    """How much the 16x changes what's on screen compared to the 4x: mean absolute luminance difference (0-255),
+    weighted by alpha, with both resampled to `scale` screen pixels per original texel (capped at 16) the way the
+    GPU would show them (bilinear when magnified, roughly mipmapped when minified)."""
+    scale = min(scale, 16.0)
+    w, h = x4.size[0] // 4, x4.size[1] // 4
+    size = (max(1, round(w * scale)), max(1, round(h * scale)))
+    views = []
+    for img, factor in ((x4, 4), (x16, 16)):
+        filt = Image.Resampling.BILINEAR if scale >= factor else Image.Resampling.LANCZOS
+        a = np.asarray(img.convert("RGBA").resize(size, filt)).astype(np.float32)
+        alpha = np.clip(a[..., 3:] * 2, 0, 255) / 255  # PS2 alpha: 128 = opaque; shown over mid grey
+        rgb = a[..., :3] * alpha + 96 * (1 - alpha)
+        views.append((rgb @ np.array([0.299, 0.587, 0.114], np.float32), alpha[..., 0]))
+    (l4, alpha), (l16, _) = views
+    weight = alpha if alpha.sum() > 0 else np.ones_like(alpha)
+    return float((np.abs(l16 - l4) * weight).sum() / weight.sum())
+
+
+def plan_second_pass(game: Path, dumps: list[Path], repl_dir: Path, skip: set[str], new: set[Path],
+                     rejected: dict) -> tuple[dict[Path, float], list[Path]]:
+    """Which textures get 16x, and which of this script's own replacements (replacements/<name>.dds, never pack
+    files) go back from 16x to 4x.
+
+    Returns ({dump: magnification} to try at 16x, [dumps whose 16x goes back to 4x]). Textures in `new` (no
+    replacement yet) that qualify go straight to 16x. Needs usage.json from texture_usage.py; without it nothing
+    changes. A texture with no measurement keeps what it has."""
     try:
         usage = json.loads((game / USAGE_FILE).read_text())
     except (OSError, ValueError):
-        return []
-    frames = usage.get("captures", 0)
-    if not frames:
-        return []
-    try:  # names with identical content are counted under the first one; boost them all
+        return {}, []
+    try:  # names with identical content are measured under the first one
         index = json.loads((USAGE_CACHE / game.name / "index.json").read_text())
         aliases = {names[0]: names for names in index["hashes"].values()}
     except (OSError, ValueError, KeyError):
         aliases = {}
-    by_stem = {p.stem: p for p in dumps}
-    out = []
+    mag = {}
     for name, t in usage.get("textures", {}).items():
-        if t["frames"] / frames < BOOST_MIN_FRAMES and t.get("max_mag", 0) < BOOST_MIN_MAG:
+        if "max_mag" in t:
+            for alias in aliases.get(name, [name]):
+                mag[alias] = max(mag.get(alias, 0.0), t["max_mag"])
+    boost, downgrade = {}, []
+    for src in dumps:
+        m, repl = mag.get(src.stem), repl_dir / f"{src.stem}.dds"
+        if m is None or src.stem in skip or not (src in new or repl.is_file()):
             continue
-        for alias in aliases.get(name, [name]):
-            src, repl = by_stem.get(alias), repl_dir / f"{alias}.dds"
-            if alias in skip or src is None or not repl.is_file():
-                continue
-            try:
-                w, h = dds_size(repl)
-                with Image.open(src) as im:
-                    sw, sh = im.size
-            except Exception:
-                continue
-            if max(w, h) <= BOOST_MAX_SIDE and (w, h) == (sw * 4, sh * 4):
-                out.append(src)
-    return sorted(set(out))
+        try:
+            with Image.open(src) as im:
+                sw, sh = im.size
+            w, h = (sw * 4, sh * 4) if src in new else dds_size(repl)
+        except Exception:
+            continue
+        if (w, h) == (sw * 4, sh * 4):
+            if m >= BOOST_MIN_MAG and max(w, h) <= BOOST_MAX_SIDE and src.stem not in rejected:
+                boost[src] = m
+        elif (w, h) == (sw * 16, sh * 16) and m < BOOST_MIN_MAG:
+            downgrade.append(src)
+    return boost, downgrade
+
+
+def save_rejected(path: Path, rejected: dict):
+    if rejected:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(rejected, indent=1, sort_keys=True))
 
 
 def choose(prompt: str, options: list[str]) -> int:
@@ -319,13 +361,22 @@ def main():
     replaced = {p.stem for p in repl_dir.rglob("*") if p.is_file()} if repl_dir.is_dir() else set()
     skipped = [p for p in dumps if p.stem in skip]
     new = [p for p in dumps if p.stem not in replaced and p.stem not in skip]
-    boost = textures_to_boost(game, dumps, repl_dir, skip)
+    rejected_file = USAGE_CACHE / game.name / BOOST_REJECTED
+    try:
+        rejected = json.loads(rejected_file.read_text())
+    except (OSError, ValueError):
+        rejected = {}
+    new_set = set(new)
+    boost, downgrade = plan_second_pass(game, dumps, repl_dir, skip, new_set, rejected)
     print(f"\n{titles.get(game.name, game.name)}: {len(dumps)} dumps, {len(dumps) - len(new) - len(skipped)} already "
           f"replaced, {len(skipped)} skipped, {len(new)} to upscale.")
     if boost:
-        print(f"{USAGE_FILE}: {len(boost)} frequently used or close-up textures get a second 4x pass (16x).")
-    todo = new + boost
-    boosted = set(boost)
+        print(f"{USAGE_FILE}: {len(boost)} close-up textures get a second 4x pass (16x), kept if it adds detail.")
+    if downgrade:
+        print(f"{USAGE_FILE}: {len(downgrade)} textures at 16x no longer seen close enough go back to 4x.")
+    todo = new + [p for p in boost if p not in new_set] + downgrade
+    downgraded = set(downgrade)
+    internal = upscale_multiplier(textures)
     if not todo:
         return
 
@@ -379,12 +430,23 @@ def main():
             for src in files:
                 n += 1
                 t0 = time.perf_counter()
+                note = "  (back to 4x)" if src in downgraded else ""
                 try:
                     with Image.open(src) as im:
                         im.load()
                         up = upscaler.upscale_image(im)
-                        if src in boosted:
-                            up = upscaler.upscale_image(up)
+                        if src in boost:
+                            up16 = upscaler.upscale_image(up)
+                            gain = second_pass_gain(up, up16, boost[src] * internal)
+                            if gain >= BOOST_MIN_GAIN:
+                                up, note = up16, f"  (16x, gain {gain:.1f})"
+                            else:
+                                rejected[src.stem] = round(gain, 2)
+                                note = f"  (16x adds too little: gain {gain:.1f}, stays 4x)"
+                                if src not in new_set:  # its 4x replacement is already there
+                                    print(f"  [{n}/{len(todo)}] {src.name}{note}  "
+                                          f"{(time.perf_counter() - t0) * 1000:.0f} ms")
+                                    continue
                 except Exception as e:
                     failed += 1
                     print(f"  [{n}/{len(todo)}] {src.name}  FAILED: {type(e).__name__}: {e}")
@@ -392,7 +454,7 @@ def main():
                 pending[pool.submit(dds.save_dds, up, repl_dir / f"{src.stem}.dds")] = src
                 drain(block=False)
                 print(f"  [{n}/{len(todo)}] {src.name}  {im.width}x{im.height} -> {up.width}x{up.height}  "
-                      f"{(time.perf_counter() - t0) * 1000:.0f} ms" + ("  (2nd pass)" if src in boosted else ""))
+                      f"{(time.perf_counter() - t0) * 1000:.0f} ms" + note)
             del upscaler
             gc.collect()  # free its GPU memory before the next model loads
         if pending:
@@ -401,8 +463,10 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted. Finished textures are kept; run again to continue.")
         pool.shutdown(wait=True, cancel_futures=True)
+        save_rejected(rejected_file, rejected)
         sys.exit(1)
     pool.shutdown()
+    save_rejected(rejected_file, rejected)
     print(f"\nDone in {time.perf_counter() - t_all:.0f}s: {converted} written, {failed} failed.")
     print(f"Replacements: {repl_dir}")
 

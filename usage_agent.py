@@ -111,27 +111,88 @@ def save_results(res):
 MAG_PERCENTILE = 0.95  # per texture and frame, the magnification of its 95th-percentile triangle is kept, so a
                        # single odd triangle can't set a texture's all-time maximum
 MIN_AREA = 1.0         # triangles under 1 screen pixel or 1 texel are too small to measure
+# Screen area is accumulated per magnification band: [<1, 1-4/3, 4/3-2, 2-3, 3-4, 4-6, 6-8, >=8]
+MAG_EDGES = (1.0, 4 / 3, 2.0, 3.0, 4.0, 6.0, 8.0)
 
 
-def triangle_mags(verts, tw, th, out):
-    """Appends the magnification of each triangle: sqrt(screen area / texel area), in native pixels per texel.
+def clipped_area(pts, rect):
+    """Area of polygon pts [(x, y)] inside rect (x0, y0, x1, y1): Sutherland-Hodgman, then the shoelace formula."""
+    x0, y0, x1, y1 = rect
+    for axis, bound, keep_above in ((0, x0, True), (0, x1, False), (1, y0, True), (1, y1, False)):
+        out = []
+        for i, p in enumerate(pts):
+            q = pts[i - 1]
+            p_in = p[axis] >= bound if keep_above else p[axis] <= bound
+            q_in = q[axis] >= bound if keep_above else q[axis] <= bound
+            if p_in != q_in:  # the edge q -> p crosses the boundary
+                t = (bound - q[axis]) / (p[axis] - q[axis])
+                c = (q[0] + t * (p[0] - q[0]), q[1] + t * (p[1] - q[1]))
+                out.append((bound, c[1]) if axis == 0 else (c[0], bound))
+            if p_in:
+                out.append(p)
+        pts = out
+        if len(pts) < 3:
+            return 0.0
+    return abs(sum(pts[i - 1][0] * p[1] - p[0] * pts[i - 1][1] for i, p in enumerate(pts))) / 2
 
-    verts: (x, y, u, v) per vertex, three per triangle; x, y in native GS pixels, u, v normalised (1 = texture size)."""
+
+def triangles(verts, tw, th, rect):
+    """(magnification, visible screen area) per triangle.
+
+    verts: (x, y, u, v) per vertex, three per triangle; x, y in native GS pixels, u, v normalised (1 = texture size).
+    Magnification is sqrt(screen area / texel area): native pixels per texel. The area is the part inside rect, the
+    screen; triangles of a road or a wall often reach far beyond it."""
     for i in range(0, len(verts) - 2, 3):
         (x0, y0, u0, v0), (x1, y1, u1, v1), (x2, y2, u2, v2) = verts[i:i + 3]
         screen = abs((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)) / 2
         texels = abs((u1 - u0) * (v2 - v0) - (u2 - u0) * (v1 - v0)) / 2 * tw * th
         if screen >= MIN_AREA and texels >= MIN_AREA:
-            out.append((screen / texels) ** 0.5)
+            yield (screen / texels) ** 0.5, clipped_area([(x0, y0), (x1, y1), (x2, y2)], rect)
 
 
-def measure_magnification(ctrl, uses, dims):
-    """How magnified each texture was in this frame: {name: magnification}.
+def screen_rect(ctrl, event, raw):
+    """The render target's extent in native GS pixels, as (x0, y0, x1, y1), plus its size in native pixels.
 
-    uses: {eventId: [texture names sampled by that draw]}. Geometry is read straight from PCSX2's vertex and index
-    buffers, which hold raw GS vertices (32 bytes: ST, RGBA, Q, XY in 1/16 pixels, Z, UV in 1/16 texels, FOG), so
-    positions come out in native PS2 pixels whatever the internal resolution. Sprites PCSX2 expands in its vertex
-    shader read those vertices as a storage buffer instead and aren't measured."""
+    Fitted from one draw: its raw vertex positions against the positions the vertex shader produced."""
+    ctrl.SetFrameEvent(event, False)
+    m = ctrl.GetPostVSData(0, 0, rd.MeshDataStage.VSOut)
+    vp = ctrl.GetPipelineState().GetViewport(0)
+    if m.vertexByteStride < 16 or not vp.width or not vp.height:
+        return None
+    if m.indexByteStride in (2, 4):
+        ib = bytes(ctrl.GetBufferData(m.indexResourceId, m.indexByteOffset, m.numIndices * m.indexByteStride))
+        pidx = struct.unpack("<%d%s" % (m.numIndices, "H" if m.indexByteStride == 2 else "I"), ib)
+    else:
+        pidx = range(m.numIndices)
+    vb = bytes(ctrl.GetBufferData(m.vertexResourceId, m.vertexByteOffset, 0))
+    pos = [struct.unpack_from("<2f", vb, i * m.vertexByteStride) for i in pidx[:len(raw)]]
+    px = [((x + 1) / 2 * vp.width + vp.x, (y + 1) / 2 * vp.height + vp.y) for x, y in pos]
+    rect = []
+    for axis, size, off in ((0, vp.width, vp.x), (1, vp.height, vp.y)):
+        k0 = 0
+        k1 = next((k for k in range(len(px)) if abs(raw[k][axis] - raw[k0][axis]) >= 4), None)
+        if k1 is None:
+            return None
+        a = (px[k1][axis] - px[k0][axis]) / (raw[k1][axis] - raw[k0][axis])  # render-target pixels per native pixel
+        b = px[k0][axis] - a * raw[k0][axis]
+        lo, hi = sorted(((off - b) / a, (off + size - b) / a))
+        rect.append((lo, hi))
+    (x0, x1), (y0, y1) = rect
+    return (x0, y0, x1, y1), (x1 - x0) * (y1 - y0)
+
+
+def measure_geometry(ctrl, uses, dims):
+    """How each texture was drawn on screen in this frame.
+
+    Returns (mags, areas, screen): mags {name: magnification}, areas {name: [visible native screen pixels per
+    MAG_EDGES band]}, and the screen's size in native pixels (0 if it couldn't be measured).
+
+    uses: {eventId: [texture names sampled by that draw]}. Only draws into the frame's main render target (the one
+    with the most draws) count: the others are off-screen passes such as reflection maps, whose pixels aren't
+    screen pixels. Geometry is read straight from PCSX2's vertex and index buffers, which hold raw GS vertices
+    (32 bytes: ST, RGBA, Q, XY in 1/16 pixels, Z, UV in 1/16 texels, FOG), so positions come out in native PS2
+    pixels whatever the internal resolution. Sprites PCSX2 expands in its vertex shader read those vertices as a
+    storage buffer instead and aren't measured."""
     actions = {}
 
     def walk(acts):
@@ -141,14 +202,21 @@ def measure_magnification(ctrl, uses, dims):
             walk(a.children)
 
     walk(ctrl.GetRootActions())
-    events = sorted(e for e in uses if e in actions and actions[e].numIndices >= 3)
+    targets = {}
+    for a in actions.values():
+        if len(a.outputs):
+            targets[a.outputs[0]] = targets.get(a.outputs[0], 0) + 1
+    if not targets:
+        return {}, {}, 0
+    main = max(targets, key=targets.get)
+    events = sorted(e for e in uses if e in actions and actions[e].numIndices >= 3 and actions[e].outputs[0] == main)
     if not events:
-        return {}
+        return {}, {}, 0
     ctrl.SetFrameEvent(events[0], True)
     pipe = ctrl.GetPipelineState()
     vbufs, ibuf = pipe.GetVBuffers(), pipe.GetIBuffer()
     if not vbufs or vbufs[0].byteStride != 32 or ibuf.byteStride not in (2, 4):
-        return {}
+        return {}, {}, 0
     vb_id, ib_id, istride = vbufs[0].resourceId, ibuf.resourceId, ibuf.byteStride
     as_vertices = {u.eventId for u in ctrl.GetUsage(vb_id) if u.usage == rd.ResourceUsage.VertexBuffer}
     events = [e for e in events if e in as_vertices]
@@ -164,7 +232,7 @@ def measure_magnification(ctrl, uses, dims):
         run.append(e)
     runs.append(run)
 
-    tris = {}
+    draws = []  # (event, raw vertices)
     for run in runs:
         ctrl.SetFrameEvent(run[-1], True)
         for e in run:
@@ -179,27 +247,42 @@ def measure_magnification(ctrl, uses, dims):
             for i in idx:
                 s, t, q, xy, uv = struct.unpack_from("<2f4xfI4xI", vb, (i - lo) * 32)
                 raw.append(((xy & 0xFFFF) / 16.0, (xy >> 16) / 16.0, s, t, q, (uv & 0xFFFF) / 16.0, (uv >> 16) / 16.0))
-            # Integer texel coordinates (FST: sprites, UI) vary in UV; perspective ones (STQ) leave UV at a constant
-            fst = len({(r[5], r[6]) for r in raw}) > 1
-            for name in uses[e]:
-                tw, th = dims.get(name, (0, 0))
-                if not tw or not th:
-                    continue
-                if fst:
-                    verts = [(r[0], r[1], r[5] / tw, r[6] / th) for r in raw]
-                else:
-                    verts = [(r[0], r[1], r[2] / r[4], r[3] / r[4]) if r[4] else (r[0], r[1], 0.0, 0.0) for r in raw]
-                triangle_mags(verts, tw, th, tris.setdefault(name, []))
+            draws.append((e, raw))
+
+    fit = None
+    for e, raw in draws:  # any draw with some extent in x and y will do
+        fit = screen_rect(ctrl, e, raw)
+        if fit:
+            break
+    if fit is None:
+        return {}, {}, 0
+    rect, screen = fit
+
+    tris, areas = {}, {}
+    for e, raw in draws:
+        # Integer texel coordinates (FST: sprites, UI) vary in UV; perspective ones (STQ) leave UV at a constant
+        fst = len({(r[5], r[6]) for r in raw}) > 1
+        for name in uses[e]:
+            tw, th = dims.get(name, (0, 0))
+            if not tw or not th:
+                continue
+            if fst:
+                verts = [(r[0], r[1], r[5] / tw, r[6] / th) for r in raw]
+            else:
+                verts = [(r[0], r[1], r[2] / r[4], r[3] / r[4]) if r[4] else (r[0], r[1], 0.0, 0.0) for r in raw]
+            band = areas.setdefault(name, [0.0] * (len(MAG_EDGES) + 1))
+            for mag, area in triangles(verts, tw, th, rect):
+                tris.setdefault(name, []).append(mag)
+                band[sum(1 for edge in MAG_EDGES if mag >= edge)] += area
     mags = {}
     for name, ms in tris.items():
-        if ms:
-            ms.sort()
-            mags[name] = ms[min(len(ms) - 1, int(len(ms) * MAG_PERCENTILE))]
-    return mags
+        ms.sort()
+        mags[name] = ms[min(len(ms) - 1, int(len(ms) * MAG_PERCENTILE))]
+    return mags, areas, screen
 
 
 def analyse(path, index, res):
-    """Counts pixel-shader reads per known texture in one capture, and records how magnified each was.
+    """Counts pixel-shader reads per known texture in one capture, and records how it was drawn on screen.
     Returns (known textures, draws) seen."""
     cap = rd.OpenCaptureFile()
     if cap.OpenFile(path, "", None) != rd.ResultCode.Succeeded:
@@ -229,17 +312,23 @@ def analyse(path, index, res):
                 for e in events:
                     uses.setdefault(e, []).append(name)
         try:
-            mags = measure_magnification(ctrl, uses, index.get("dims", {}))
+            mags, areas, screen = measure_geometry(ctrl, uses, index.get("dims", {}))
         except Exception as e:  # counting still holds without it
-            log("magnification not measured: %r" % e)
-            mags = {}
+            log("geometry not measured: %r" % e)
+            mags, areas, screen = {}, {}, 0
         for name, draws in seen.items():
             t = res["textures"].setdefault(name, {"frames": 0, "draws": 0})
             t["frames"] += 1
             t["draws"] += draws
             if name in mags and mags[name] > t.get("max_mag", 0):
                 t["max_mag"] = round(mags[name], 2)
+            if screen and name in areas:
+                acc = t.setdefault("area_mag", [0.0] * (len(MAG_EDGES) + 1))
+                t["area_mag"] = [round(x + y, 1) for x, y in zip(acc, areas[name])]
         res["captures"] += 1
+        if screen:  # captures whose geometry was measured, and their total screen area: the base for exposure
+            res["geo_captures"] = res.get("geo_captures", 0) + 1
+            res["screen_px"] = round(res.get("screen_px", 0) + screen)
         return len(seen), sum(seen.values())
     finally:
         ctrl.Shutdown()
