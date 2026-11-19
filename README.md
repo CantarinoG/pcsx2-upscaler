@@ -88,6 +88,7 @@ in frames  draws/frame  status    texture
 - Textures are recognised by content: a replacement by its `.dds` data, a texture without one by its dump. Variants with identical content (same texture, different palette hash) are counted together.
 - The upscaler reads these counts to give frequently drawn textures a second pass (see "How it works").
 - Counts add up across sessions in `<textures>/<GAME>/usage.json`. `--reset` starts over, `--report` only prints the report.
+- Frames are only captured while the chosen game is running: paused emulation, the BIOS or another game don't count. The script asks PCSX2 through its PINE interface, which it switches on in `PCSX2.ini` (`EnablePINE = true`) if needed.
 - PCSX2 runs under X11 (XWayland) for this, since RenderDoc can't capture Wayland windows. An AppImage is extracted once to `~/.cache/pcsx2-upscaler/pcsx2/`, because RenderDoc can't inject into the AppImage launcher.
 
 ## Files

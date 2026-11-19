@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Measure how often a PCSX2 game uses each of its textures, by sampling frames with RenderDoc while you play.
 
-Pick a game, then play it in the PCSX2 window that opens. Every --interval seconds one frame is captured
-(a short freeze), the textures drawn in it are counted, and the capture is deleted. Counts are matched to the
+Pick a game, then play it in the PCSX2 window that opens. Every --interval seconds of gameplay one frame is
+captured (a short freeze), the textures drawn in it are counted, and the capture is deleted. Nothing is captured
+while emulation is paused or another game is running (checked through PCSX2's PINE IPC, enabled in PCSX2.ini). Counts are matched to the
 names in <textures>/<GAME>/dumps and replacements/, and accumulate in <textures>/<GAME>/usage.json across sessions.
 Close PCSX2 to end the session and print the report.
 
@@ -144,7 +145,36 @@ def check_vulkan_layer(renderdoc: Path):
                  f"  {renderdoc / 'bin' / 'renderdoccmd'} vulkanlayer --register --user")
 
 
-def run_session(game: Path, index: Path, renderdoc: Path, pcsx2: Path, interval: float):
+PINE_DEFAULT_SLOT = 28011
+
+
+def enable_pine(textures: Path) -> str | None:
+    """Turns on PCSX2's PINE IPC in PCSX2.ini (used to tell when the game is paused) and returns its socket path.
+
+    None if the ini can't be found: sampling then runs without pause detection."""
+    ini = textures.parent / "inis" / "PCSX2.ini"
+    try:
+        text = ini.read_text()
+    except OSError:
+        print(f"Warning: {ini} not found; frames will be captured even while PCSX2 is paused.")
+        return None
+    m = re.search(r"^PINESlot\s*=\s*(\d+)\s*$", text, re.M)
+    slot = int(m.group(1)) if m else PINE_DEFAULT_SLOT
+    if not re.search(r"^EnablePINE\s*=\s*true\s*$", text, re.M | re.I):
+        if re.search(r"^EnablePINE\s*=.*$", text, re.M):
+            text = re.sub(r"^EnablePINE\s*=.*$", "EnablePINE = true", text, count=1, flags=re.M)
+        elif "[EmuCore]" in text:
+            text = text.replace("[EmuCore]\n", "[EmuCore]\nEnablePINE = true\n", 1)
+        else:
+            text += "\n[EmuCore]\nEnablePINE = true\n"
+        ini.write_text(text)
+        print(f"Enabled PINE in {ini} (lets this script skip frames while the game is paused).")
+    # Same path PCSX2 uses (PINEServer.cpp): $XDG_RUNTIME_DIR/pcsx2.sock, with ".<slot>" for a non-default slot
+    sock = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "pcsx2.sock"
+    return str(sock) + (f".{slot}" if slot != PINE_DEFAULT_SLOT else "")
+
+
+def run_session(game: Path, index: Path, renderdoc: Path, pcsx2: Path, interval: float, pine: str | None):
     work = CACHE / "usage" / game.name
     captures = work / "captures"
     shutil.rmtree(captures, ignore_errors=True)  # leftovers of an interrupted session
@@ -153,12 +183,13 @@ def run_session(game: Path, index: Path, renderdoc: Path, pcsx2: Path, interval:
     log.write_text("")
     cfg = work / "agent.json"
     cfg.write_text(json.dumps({"index": str(index), "output": str(game / USAGE_FILE), "log": str(log),
-                               "pcsx2": str(pcsx2), "interval": interval,
+                               "pcsx2": str(pcsx2), "interval": interval, "pine": pine, "serial": game.name,
                                "capture_template": str(captures / "frame")}))
     env = dict(os.environ, USAGE_AGENT_CONFIG=str(cfg), QT_QPA_PLATFORM="xcb")
     agent = subprocess.Popen([str(renderdoc / "bin" / "qrenderdoc"), "--python", str(ROOT / "usage_agent.py")],
                              env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f"Starting PCSX2 under RenderDoc. Open the game and play; one frame is captured every {interval:g}s.\n"
+    print(f"Starting PCSX2 under RenderDoc. Open the game and play; one frame is captured every {interval:g}s "
+          "while it runs.\n"
           "Close PCSX2 to finish (Ctrl+C here stops sampling but leaves PCSX2 open).\n")
     pos = 0
     try:
@@ -237,7 +268,8 @@ def main():
         if args.reset:
             (game / USAGE_FILE).unlink(missing_ok=True)
         index = build_index(game)
-        run_session(game, index, renderdoc, pcsx2, args.interval)
+        pine = enable_pine(textures)
+        run_session(game, index, renderdoc, pcsx2, args.interval, pine)
     report(game, title, args.top)
 
 

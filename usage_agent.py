@@ -5,11 +5,16 @@ textures the game drew with. GPU textures are identified by content: a replaceme
 data of its .dds, and a texture without one as the decoded RGBA pixels of its dump. Both were hashed beforehand by
 texture_usage.py. Each capture is deleted once counted; totals are saved to the output JSON after every capture.
 
+Frames are only captured while the chosen game is actually running: PCSX2's PINE interface is asked first, so time
+spent paused, in the BIOS or in another game doesn't count.
+
 RenderDoc's Python is 3.8 with no third-party packages, so this file uses only the standard library.
 """
 import hashlib
 import json
 import os
+import socket
+import struct
 import sys
 import time
 import traceback
@@ -23,6 +28,69 @@ log_file = open(cfg["log"], "a")
 def log(msg):
     line = time.strftime("%H:%M:%S ") + msg
     print(line, file=log_file, flush=True)
+
+
+class Pine:
+    """Minimal client for PCSX2's PINE IPC: request = [u32 size][u8 opcode], reply = [u32 size][u8 result][data]."""
+    MSG_ID, MSG_STATUS = 0x0C, 0x0F
+    STATUS = {0: "running", 1: "paused", 2: "shutdown"}
+
+    def __init__(self, path):
+        self.path, self.sock = path, None
+
+    def _recv(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise OSError("PINE connection closed")
+            buf += chunk
+        return buf
+
+    def _call(self, opcode):
+        """Reply data, or None if PCSX2 can't be reached or refused the request."""
+        try:
+            if self.sock is None:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(2)
+                s.connect(self.path)
+                self.sock = s
+            self.sock.sendall(struct.pack("<IB", 5, opcode))
+            size = struct.unpack("<I", self._recv(4))[0]
+            body = self._recv(size - 4)
+        except OSError:
+            if self.sock is not None:
+                self.sock.close()
+            self.sock = None
+            return None
+        return body[1:] if body[:1] == b"\x00" else None
+
+    def state(self):
+        """'running', 'paused', 'shutdown', or None when PCSX2 isn't reachable."""
+        data = self._call(self.MSG_STATUS)
+        return self.STATUS.get(struct.unpack_from("<I", data)[0]) if data and len(data) >= 4 else None
+
+    def serial(self):
+        data = self._call(self.MSG_ID)
+        if not data or len(data) < 4:
+            return None
+        n = struct.unpack_from("<I", data)[0]
+        return data[4:4 + n].split(b"\x00")[0].decode(errors="replace")
+
+
+def why_not_capture(pine):
+    """None when the chosen game is running, otherwise the reason to wait."""
+    if pine is None:  # no PINE configured: capture regardless, as before
+        return None
+    state = pine.state()
+    if state is None:
+        return "waiting for PCSX2 (PINE not reachable yet)"
+    if state != "running":
+        return "emulation %s, not capturing" % state
+    serial = pine.serial()
+    if serial != cfg["serial"]:
+        return "%s is running, not %s: not capturing" % (serial or "no game", cfg["serial"])
+    return None
 
 
 def load_results():
@@ -95,8 +163,10 @@ def main():
     if target is None:
         log("FAILED to connect to PCSX2")
         return 2
-    log("PCSX2 running; capturing every %ss" % cfg["interval"])
+    log("PCSX2 running; capturing every %ss of gameplay" % cfg["interval"])
 
+    pine = Pine(cfg["pine"]) if cfg.get("pine") else None
+    waiting = None  # reason logged for the current wait, so it's printed once
     next_capture = time.time() + cfg["interval"]
     while target.Connected():
         msg = target.ReceiveMessage(None)
@@ -118,8 +188,21 @@ def main():
                     pass
             next_capture = time.time() + cfg["interval"]
         if time.time() >= next_capture:
-            target.TriggerCapture(1)
-            next_capture = time.time() + 60  # re-armed when the capture arrives; retried if it never does
+            reason = why_not_capture(pine)
+            if reason is None:
+                if waiting is not None:
+                    log("game running again, capturing")
+                    waiting = None
+                    # the interval restarts so a frame isn't grabbed the instant the game resumes
+                    next_capture = time.time() + cfg["interval"]
+                    continue
+                target.TriggerCapture(1)
+                next_capture = time.time() + 60  # re-armed when the capture arrives; retried if it never does
+            else:
+                if reason != waiting:
+                    log(reason)
+                    waiting = reason
+                next_capture = time.time() + 1
         time.sleep(0.1)
     target.Shutdown()
     log("PCSX2 closed")
