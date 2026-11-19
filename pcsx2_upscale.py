@@ -52,6 +52,7 @@ BOOST_MIN_MAG = 3.3     # closest sampled view: native screen pixels per origina
 BOOST_MIN_GAIN = 3.0    # mean luminance change (0-255) 16x makes over 4x at that view; less = nothing to see
 BOOST_MAX_SIDE = 512    # only textures whose 4x replacement is at most this big
 BOOST_REJECTED = "boost_rejected.json"  # per game, in USAGE_CACHE: textures whose 16x added too little
+BOOST_RETRY_MAG = 1.25  # a rejected texture is tried again once seen this much more magnified than when rejected
 DDS_WORKERS = max(1, min(4, (os.cpu_count() or 2) // 2))  # BC7 encoding is CPU-bound and single-threaded
 
 MIN_SIDE = 64          # some models fail on tiny inputs; smaller images are wrap-padded up to this
@@ -305,11 +306,20 @@ def plan_second_pass(game: Path, dumps: list[Path], repl_dir: Path, skip: set[st
         except Exception:
             continue
         if (w, h) == (sw * 4, sh * 4):
-            if m >= BOOST_MIN_MAG and max(w, h) <= BOOST_MAX_SIDE and src.stem not in rejected:
+            if m >= BOOST_MIN_MAG and max(w, h) <= BOOST_MAX_SIDE and retry_rejected(rejected, src.stem, m):
                 boost[src] = m
         elif (w, h) == (sw * 16, sh * 16) and m < BOOST_MIN_MAG:
             downgrade.append(src)
     return boost, downgrade
+
+
+def retry_rejected(rejected: dict, name: str, mag: float) -> bool:
+    """True if `name` was never rejected, or has since been seen at least BOOST_RETRY_MAG times closer (a closer
+    view can make the 16x worth it). Entries without a magnification (older format) are retried once."""
+    entry = rejected.get(name)
+    if entry is None:
+        return True
+    return not isinstance(entry, dict) or mag >= entry.get("mag", 0.0) * BOOST_RETRY_MAG
 
 
 def save_rejected(path: Path, rejected: dict):
@@ -441,7 +451,7 @@ def main():
                             if gain >= BOOST_MIN_GAIN:
                                 up, note = up16, f"  (16x, gain {gain:.1f})"
                             else:
-                                rejected[src.stem] = round(gain, 2)
+                                rejected[src.stem] = {"gain": round(gain, 2), "mag": boost[src]}
                                 note = f"  (16x adds too little: gain {gain:.1f}, stays 4x)"
                                 if src not in new_set:  # its 4x replacement is already there
                                     print(f"  [{n}/{len(todo)}] {src.name}{note}  "
