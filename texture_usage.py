@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from pcsx2_upscale import DEFAULT_TEXTURES, IMAGE_EXTS, USAGE_CACHE, USAGE_FILE, choose, load_game_titles, load_skip_list
+from pcsx2_upscale import DEFAULT_TEXTURES, IMAGE_EXTS, USAGE_CACHE, USAGE_FILE, choose, game_skip_list, load_game_titles
 
 ROOT = Path(__file__).resolve().parent
 CACHE = USAGE_CACHE.parent
@@ -227,7 +227,7 @@ def report(game: Path, title: str, top: int):
         return
     repl = game / "replacements"
     replaced = {p.stem for p in repl.rglob("*") if p.is_file()} if repl.is_dir() else set()
-    skip = load_skip_list(game)
+    skip = game_skip_list(game)
     rows = sorted(res["textures"].items(), key=lambda kv: (-kv[1]["frames"], -kv[1]["draws"]))
     try:  # how many other names share each texture's content
         index = json.loads((CACHE / "usage" / game.name / "index.json").read_text())

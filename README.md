@@ -14,6 +14,7 @@ Upscales a PCSX2 game's dumped textures 4x with ONNX models and writes them as B
 
 - **Only what's missing:** a dump counts as replaced if a file with the same name (any extension) exists anywhere under `replacements/`, including texture-pack subfolders. Downloaded packs are never overwritten, and an interrupted run continues where it stopped.
 - **Skip list:** textures named in `<textures>/<GAME>/skip.txt` are never upscaled, and any existing replacement for them under `replacements/` (pack subfolders included) is deleted on each run, so the game shows the original texture.
+- **Game plugins:** a game can have a plugin, `plugins/<GAME>.py`, with rules only that game needs, loaded automatically. For now plugins can leave textures unreplaced by inspecting them (see [plugins/README.md](plugins/README.md)). Need for Speed: Underground's skips scratch video memory dumped as textures and car body skins, which the game builds anew for every paint and vinyl combination.
 - **Second pass for close-up textures:** if the game has been measured with `texture_usage.py` (see below), textures seen magnified 3.3x or more (see "closest" below) whose 4x replacement is 512 px or smaller are upscaled 4x again, to 16x the dump. The 16x is only kept if it visibly changes the texture at that view (mean luminance change of at least 3/255; flat textures, glows and gradients gain nothing), otherwise the 4x stays and the texture is recorded in `~/.cache/pcsx2-upscaler/usage/<GAME>/boost_rejected.json` with the magnification it was judged at. It's only tried again once seen at least 25% more magnified (`BOOST_RETRY_MAG`), since a closer view can make the 16x worth it. 16x replacements of textures that no longer qualify go back to 4x. Only this script's own replacements are touched, never pack files.
 
   The thresholds come from a blind A/B test of 50 textures shown at their closest in-game view: below 1.5x magnification 4x and 16x couldn't be told apart, between 1.5x and 3.3x it was a coin toss (and text sometimes looked worse at 16x), and from 3.3x on 16x was preferred 18 times out of 21 and never looked worse. They're `BOOST_MIN_MAG`, `BOOST_MIN_GAIN` and `BOOST_MAX_SIDE` at the top of `pcsx2_upscale.py`.
@@ -61,8 +62,8 @@ Create `<textures>/<GAME>/skip.txt` with one texture per line. Each line can be 
 # blurry HUD font, the original looks better
 1a5f3316f752e298-2838fc9f5ff51c7c-000059d3
 replacements/pack/1a8dd21b75996f4a-8b1fe45826ac4020-00005194.dds
-# NFSU: 512x512 scratch VRAM (mostly black, scrambled strips), a new hash every time
-*-8000264a
+# every texture whose name ends this way
+*-0000a1b2
 ```
 
 On the next run those textures are skipped, and their existing replacements are deleted, including ones from downloaded packs.
@@ -107,3 +108,4 @@ A second list follows with the most magnified textures.
 | `dds.py` | BC7 `.dds` writer with mipmaps, in the layout PCSX2's loader expects |
 | `texture_usage.py` | Texture usage sampling: indexes the textures, runs the session, prints the report |
 | `usage_agent.py` | Runs inside RenderDoc: launches PCSX2, captures frames, counts textures per frame |
+| `plugins/` | Per-game rules (see [plugins/README.md](plugins/README.md)) |

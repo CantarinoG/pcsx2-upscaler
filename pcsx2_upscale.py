@@ -9,7 +9,8 @@ replacements/, including texture-pack subfolders, so downloaded packs are never 
 Textures with readable text (signs, logos, UI) go through TEXT_MODEL; everything else through OTHER_MODEL.
 
 Textures listed in <textures>/<GAME>/skip.txt are never upscaled, and any replacement for them under
-replacements/ (including texture-pack subfolders) is deleted, so the game shows the original.
+replacements/ (including texture-pack subfolders) is deleted, so the game shows the original. A game can also have
+a plugin, plugins/<GAME>.py, with game-specific rules (see plugins/README.md); its skips work the same way.
 
 If texture_usage.py has measured the game (<textures>/<GAME>/usage.json), textures seen strongly magnified get a
 second 4x pass (16x the dump in total), kept only if it visibly adds detail; 16x replacements of textures that no
@@ -18,8 +19,11 @@ longer qualify go back to 4x. See BOOST_* below.
 Usage: pcsx2_upscale.py [textures_dir]      (default: ~/.config/PCSX2/textures)
 """
 import argparse
+import collections
 import fnmatch
 import gc
+import hashlib
+import importlib.util
 import json
 import multiprocessing
 import os
@@ -39,6 +43,8 @@ from textdet import TextDetector
 
 ROOT = Path(__file__).resolve().parent
 MODELS_DIR = ROOT / "models"
+PLUGINS_DIR = ROOT / "plugins"  # per game: <GAME>.py with game-specific rules
+PLUGIN_CACHE = "plugin_skip.json"  # per game, in USAGE_CACHE: the plugin's answers per dump
 TEXT_MODEL = MODELS_DIR / "text.onnx"   # keeps lettering legible
 OTHER_MODEL = MODELS_DIR / "other.onnx"  # materials, images, foliage, ...
 DEFAULT_TEXTURES = Path.home() / ".config" / "PCSX2" / "textures"
@@ -251,6 +257,68 @@ def load_skip_list(game: Path) -> SkipList:
     return SkipList(names, patterns)
 
 
+def load_plugin(game: Path):
+    """The game's plugin, plugins/<GAME>.py (e.g. plugins/SLUS-20811.py), as a module, or None."""
+    path = PLUGINS_DIR / f"{game.name}.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(f"plugin_{game.name.replace('-', '_')}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def plugin_skips(game: Path) -> dict[str, str]:
+    """{dump name: reason} for the dumps the game's plugin wants left unreplaced.
+
+    A plugin may define skip(path) -> reason or None, called once per dump (path is the dump file). Answers are
+    cached per dump in USAGE_CACHE/<GAME>/plugin_skip.json and recomputed whenever the plugin file changes."""
+    plugin = load_plugin(game)
+    if plugin is None or not hasattr(plugin, "skip"):
+        return {}
+    dumps_dir = game / "dumps"
+    if not dumps_dir.is_dir():
+        return {}
+    version = hashlib.sha1((PLUGINS_DIR / f"{game.name}.py").read_bytes()).hexdigest()
+    cache_file = USAGE_CACHE / game.name / PLUGIN_CACHE
+    try:
+        cache = json.loads(cache_file.read_text())
+        answers = cache["answers"] if cache.get("version") == version else {}
+    except (OSError, ValueError, KeyError):
+        answers = {}
+    dumps = [p for p in sorted(dumps_dir.iterdir()) if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    todo = [p for p in dumps if p.stem not in answers]
+    for i, p in enumerate(todo, 1):
+        try:
+            answers[p.stem] = plugin.skip(p) or None
+        except Exception as e:
+            print(f"\n  plugin failed on {p.name}: {type(e).__name__}: {e}")
+            answers[p.stem] = None
+        if len(todo) > 50 and (i % 50 == 0 or i == len(todo)):
+            print(f"\rplugins/{game.name}.py: checking dumps... {i}/{len(todo)}", end="", flush=True)
+    if len(todo) > 50:
+        print()
+    if todo:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps({"version": version, "answers": answers}))
+    present = {p.stem for p in dumps}
+    return {name: str(reason) for name, reason in answers.items() if reason and name in present}
+
+
+def game_skip_list(game: Path, verbose: bool = False) -> SkipList:
+    """skip.txt plus what the game's plugin skips."""
+    skip = load_skip_list(game)
+    if verbose and skip:
+        print(f"\n{SKIP_FILE}: {skip} to leave unreplaced.")
+    by_plugin = plugin_skips(game)
+    if verbose and by_plugin:
+        reasons = collections.Counter(by_plugin.values())
+        print(f"plugins/{game.name}.py: leaves {len(by_plugin)} dumps unreplaced: "
+              + ", ".join(f"{n} {r}" for r, n in reasons.most_common()))
+    skip.names |= set(by_plugin)
+    return skip
+
+
 def remove_skipped(repl_dir: Path, skip: SkipList) -> int:
     """Deletes replacements of skipped textures, wherever they are under replacements/."""
     if not skip or not repl_dir.is_dir():
@@ -387,9 +455,8 @@ def main():
     if not dumps_dir.is_dir():
         sys.exit(f"{game.name} has no dumps folder.")
 
-    skip = load_skip_list(game)
+    skip = game_skip_list(game, verbose=True)
     if skip:
-        print(f"\n{SKIP_FILE}: {skip} to leave unreplaced.")
         if n := remove_skipped(repl_dir, skip):
             print(f"Removed {n} replacements of skipped textures.")
 
