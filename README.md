@@ -1,6 +1,8 @@
 # pcsx2-upscaler
 
-Upscales a PCSX2 game's dumped textures 4x with ONNX models and writes them as BC7 `.dds` replacements that PCSX2 loads directly. Textures with text use one model and everything else uses another.
+A workflow that upscales a PCSX2 game's dumped textures 4x and writes them as BC7 `.dds` replacements that PCSX2 loads directly. Textures with text use one model and everything else uses another.
+
+**Bring your own model:** no upscaling models are included. You supply any two 4x ONNX upscalers (or the same one twice), and the workflow handles everything around them: sorting textures by text, edge padding, PS2 alpha, tiling on low VRAM, mipmapped `.dds` output, skips and close-up passes. How good the replacements look depends mostly on the models you choose.
 
 ```
                                      ┌─ has text ─► text model ──┐
@@ -10,6 +12,8 @@ Upscales a PCSX2 game's dumped textures 4x with ONNX models and writes them as B
 
 ![Before and after: a graffiti-covered wall, a logo and a brick facade from Need for Speed: Underground](docs/comparison.jpg)
 
+*Made with one particular pair of models. Results vary with the models you use.*
+
 ## How it works
 
 - **Only what's missing:** a dump counts as replaced if a file with the same name (any extension) exists anywhere under `replacements/`, including texture-pack subfolders. Downloaded packs are never overwritten, and an interrupted run continues where it stopped.
@@ -18,7 +22,7 @@ Upscales a PCSX2 game's dumped textures 4x with ONNX models and writes them as B
 - **Second pass for close-up textures:** if the game has been measured with `texture_usage.py` (see below), textures seen magnified 3.3x or more (see "closest" below) whose 4x replacement is 512 px or smaller are upscaled 4x again, to 16x the dump. The 16x is only kept if it visibly changes the texture at that view (mean luminance change of at least 3/255; flat textures, glows and gradients gain nothing), otherwise the 4x stays and the texture is recorded in `~/.cache/pcsx2-upscaler/usage/<GAME>/boost_rejected.json` with the magnification it was judged at. It's only tried again once seen at least 25% more magnified (`BOOST_RETRY_MAG`), since a closer view can make the 16x worth it. 16x replacements of textures that no longer qualify go back to 4x. Only this script's own replacements are touched, never pack files.
 
   The thresholds come from a blind A/B test of 50 textures shown at their closest in-game view: below 1.5x magnification 4x and 16x couldn't be told apart, between 1.5x and 3.3x it was a coin toss (and text sometimes looked worse at 16x), and from 3.3x on 16x was preferred 18 times out of 21 and never looked worse. They're `BOOST_MIN_MAG`, `BOOST_MIN_GAIN` and `BOOST_MAX_SIDE` at the top of `pcsx2_upscale.py`.
-- **Text detection:** OCR (RapidOCR with PP-OCRv4, Latin and Chinese) runs on each texture first. A texture counts as text when OCR reads at least 2 characters with confidence ≥ 0.5. On 229 hand-labelled dumps this gave 89% precision and 98% recall; the old "detected text area" approach peaked at about 63% / 81%. The rule favours recall because the non-text model garbles lettering, while the text model handles any texture well. It runs on the GPU at about 75 ms per texture.
+- **Text detection:** OCR (RapidOCR with PP-OCRv4, Latin and Chinese) runs on each texture first. A texture counts as text when OCR reads at least 2 characters with confidence ≥ 0.5. On 229 hand-labelled dumps this gave 89% precision and 98% recall; the old "detected text area" approach peaked at about 63% / 81%. The rule favours recall because a general-purpose model tends to garble lettering, while a text-oriented model usually handles any texture well. It runs on the GPU at about 75 ms per texture.
 - **Edges:** each texture is padded before upscaling. If its opposite edges match (repeating ground and wall textures), it's padded with them, so the upscale tiles without seams. Otherwise (gradients, shadows, UI bars) it's mirrored, so one edge doesn't bleed into the other.
 - **PS2 alpha:** transparency runs 0–128 on the PS2 (128 = opaque). It stays within each dump's own range:
   - near-uniform alpha is resized normally;
@@ -33,7 +37,7 @@ uv venv .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
-Put two 4x ONNX upscalers of your choice in `models/` (the file names are set at the top of `pcsx2_upscale.py`):
+Put two 4x ONNX upscalers of your choice in `models/` (the file names are set at the top of `pcsx2_upscale.py`). Any 4x single-image super-resolution model exported to ONNX should work; to use one model for everything, put it under both names:
 
 | File | Used for |
 |---|---|
