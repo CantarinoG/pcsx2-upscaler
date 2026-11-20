@@ -55,12 +55,14 @@ Pick a game from the list (names come from PCSX2's game list). The script first 
 
 ### Leaving textures unreplaced
 
-Create `<textures>/<GAME>/skip.txt` with one texture per line. Each line can be the hash, the file name (any extension) or a full path; `#` starts a comment:
+Create `<textures>/<GAME>/skip.txt` with one texture per line. Each line can be the hash, the file name (any extension) or a full path; `#` starts a comment. Lines with wildcards (`*`, `?`, `[...]`) are patterns matched against the whole name, for families of textures that keep showing up under new hashes:
 
 ```
 # blurry HUD font, the original looks better
 1a5f3316f752e298-2838fc9f5ff51c7c-000059d3
 replacements/pack/1a8dd21b75996f4a-8b1fe45826ac4020-00005194.dds
+# NFSU: 512x512 scratch VRAM (mostly black, scrambled strips), a new hash every time
+*-8000264a
 ```
 
 On the next run those textures are skipped, and their existing replacements are deleted, including ones from downloaded packs.

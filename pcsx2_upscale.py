@@ -18,6 +18,7 @@ longer qualify go back to 4x. See BOOST_* below.
 Usage: pcsx2_upscale.py [textures_dir]      (default: ~/.config/PCSX2/textures)
 """
 import argparse
+import fnmatch
 import gc
 import json
 import multiprocessing
@@ -211,21 +212,46 @@ def load_game_titles(textures: Path) -> dict[str, str]:
     return titles
 
 
-def load_skip_list(game: Path) -> set[str]:
-    """Texture names (hash, file name or path; any extension) listed in <game>/skip.txt. '#' starts a comment."""
+class SkipList:
+    """Texture names from skip.txt, plus wildcard patterns (*, ?, [...]) matched against the whole name."""
+
+    def __init__(self, names: set[str], patterns: list[str]):
+        self.names = names
+        self.patterns = patterns
+        self._regex = re.compile("|".join(fnmatch.translate(p) for p in patterns)) if patterns else None
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.names or bool(self._regex and self._regex.match(name))
+
+    def __bool__(self) -> bool:
+        return bool(self.names or self.patterns)
+
+    def __str__(self) -> str:
+        parts = [f"{len(self.names)} textures"] if self.names else []
+        if self.patterns:
+            parts.append(f"{len(self.patterns)} pattern{'s' * (len(self.patterns) > 1)} ({', '.join(self.patterns)})")
+        return " and ".join(parts)
+
+
+def load_skip_list(game: Path) -> SkipList:
+    """Texture names (hash, file name or path; any extension) listed in <game>/skip.txt. '#' starts a comment.
+    Lines with wildcards (*, ?, [...]) are patterns, e.g. *-8000264a skips every texture whose name ends that way."""
     path = game / SKIP_FILE
-    if not path.is_file():
-        return set()
-    names = set()
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.split("#", 1)[0].strip()
-        if line:
-            name = Path(line).name
-            names.add(Path(name).stem if Path(name).suffix.lower() in IMAGE_EXTS else name)
-    return names
+    names, patterns = set(), []
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                name = Path(line).name
+                name = Path(name).stem if Path(name).suffix.lower() in IMAGE_EXTS else name
+                if any(c in name for c in "*?["):
+                    patterns.append(name)
+                else:
+                    names.add(name)
+    return SkipList(names, patterns)
 
 
-def remove_skipped(repl_dir: Path, skip: set[str]) -> int:
+def remove_skipped(repl_dir: Path, skip: SkipList) -> int:
     """Deletes replacements of skipped textures, wherever they are under replacements/."""
     if not skip or not repl_dir.is_dir():
         return 0
@@ -272,7 +298,7 @@ def second_pass_gain(x4: Image.Image, x16: Image.Image, scale: float) -> float:
     return float((np.abs(l16 - l4) * weight).sum() / weight.sum())
 
 
-def plan_second_pass(game: Path, dumps: list[Path], repl_dir: Path, skip: set[str], new: set[Path],
+def plan_second_pass(game: Path, dumps: list[Path], repl_dir: Path, skip: SkipList, new: set[Path],
                      rejected: dict) -> tuple[dict[Path, float], list[Path]]:
     """Which textures get 16x, and which of this script's own replacements (replacements/<name>.dds, never pack
     files) go back from 16x to 4x.
@@ -363,7 +389,7 @@ def main():
 
     skip = load_skip_list(game)
     if skip:
-        print(f"\n{SKIP_FILE}: {len(skip)} textures to leave unreplaced.")
+        print(f"\n{SKIP_FILE}: {skip} to leave unreplaced.")
         if n := remove_skipped(repl_dir, skip):
             print(f"Removed {n} replacements of skipped textures.")
 
