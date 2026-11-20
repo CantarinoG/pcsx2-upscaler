@@ -68,6 +68,8 @@ replacements/pack/1a8dd21b75996f4a-8b1fe45826ac4020-00005194.dds
 
 On the next run those textures are skipped, and their existing replacements are deleted, including ones from downloaded packs.
 
+`recommended_skips.csv` lists textures worth skipping per game (serial, game, texture, what it is, why). Copy the `texture` column of your game's rows into its `skip.txt` to use them.
+
 ## Texture usage (optional)
 
 `texture_usage.py` measures how often the game draws each texture and how close to the camera it gets, so you can see which replacements matter most (or which texture is behind a glitch). It samples frames with [RenderDoc](https://renderdoc.org) while you play: every 20 seconds one frame is captured (a freeze of about half a second), the textures drawn in it are counted, and the capture is deleted.
@@ -109,3 +111,4 @@ A second list follows with the most magnified textures.
 | `texture_usage.py` | Texture usage sampling: indexes the textures, runs the session, prints the report |
 | `usage_agent.py` | Runs inside RenderDoc: launches PCSX2, captures frames, counts textures per frame |
 | `plugins/` | Per-game rules (see [plugins/README.md](plugins/README.md)) |
+| `recommended_skips.csv` | Textures worth skipping, per game |
