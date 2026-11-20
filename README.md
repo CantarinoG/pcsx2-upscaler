@@ -105,6 +105,21 @@ A second list follows with the most magnified textures.
 - Frames are only captured while the chosen game is running: paused emulation, the BIOS or another game don't count. The script asks PCSX2 through its PINE interface, which it switches on in `PCSX2.ini` (`EnablePINE = true`) if needed.
 - PCSX2 runs under X11 (XWayland) for this, since RenderDoc can't capture Wayland windows. An AppImage is extracted once to `~/.cache/pcsx2-upscaler/pcsx2/`, because RenderDoc can't inject into the AppImage launcher.
 
+## Comparison video (optional)
+
+`compare_video.py` turns two captures of the same gameplay, one with original textures and one upscaled, into a comparison video: a title card, then the gameplay with a divider sweeping across (original on the left, upscaled on the right), with the game's audio. It needs `ffmpeg`.
+
+1. In PCSX2, under **Settings → Graphics → Media Capture**, capture at the internal resolution with a high bitrate (around 40,000 kbps), or the upscale is lost in the video.
+2. Load a savestate, then **Tools → Input Recording → New...**, start from **Current Frame**, play the part to show and stop the recording.
+3. Replay it twice (**Tools → Input Recording → Play...**) with **Tools → Video Capture** running: once with **Load Texture Replacements** off, once on (with **Precache Texture Replacements** on, so nothing pops in late). Each capture can start and stop whenever is convenient.
+4. Run:
+
+```bash
+.venv/bin/python compare_video.py [original.mp4 upscaled.mp4] [--out FILE] [--title TEXT]
+```
+
+Without arguments it takes the two newest captures in `~/.config/PCSX2/videos/` and works out which one is upscaled (the sharper one). It lines them up by their audio, so they can start a few frames apart, and stops if the replays drifted apart. The video is written next to the captures as `<game>_comparison.mp4`.
+
 ## Files
 
 | File | Purpose |
@@ -114,5 +129,6 @@ A second list follows with the most magnified textures.
 | `dds.py` | BC7 `.dds` writer with mipmaps, in the layout PCSX2's loader expects |
 | `texture_usage.py` | Texture usage sampling: indexes the textures, runs the session, prints the report |
 | `usage_agent.py` | Runs inside RenderDoc: launches PCSX2, captures frames, counts textures per frame |
+| `compare_video.py` | Comparison video from two captures of the same input recording |
 | `plugins/` | Per-game rules (see [plugins/README.md](plugins/README.md)) |
 | `recommended_skips.csv` | Textures worth skipping, per game |
