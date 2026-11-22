@@ -353,14 +353,16 @@ def upscale_multiplier(textures: Path) -> float:
 def second_pass_gain(x4: Image.Image, x16: Image.Image, scale: float) -> float:
     """How much the 16x changes what's on screen compared to the 4x: mean absolute luminance difference (0-255),
     weighted by alpha, with both resampled to `scale` screen pixels per original texel (capped at 16) the way the
-    GPU would show them (bilinear when magnified, roughly mipmapped when minified)."""
+    GPU would show them (bilinear when magnified, roughly mipmapped when minified). Channels are resampled
+    separately: resized as RGBA, Pillow weights colour by alpha, which on the PS2 is often not opacity."""
     scale = min(scale, 16.0)
     w, h = x4.size[0] // 4, x4.size[1] // 4
     size = (max(1, round(w * scale)), max(1, round(h * scale)))
     views = []
     for img, factor in ((x4, 4), (x16, 16)):
         filt = Image.Resampling.BILINEAR if scale >= factor else Image.Resampling.LANCZOS
-        a = np.asarray(img.convert("RGBA").resize(size, filt)).astype(np.float32)
+        channels = [c.resize(size, filt) for c in img.convert("RGBA").split()]
+        a = np.dstack([np.asarray(c) for c in channels]).astype(np.float32)
         alpha = np.clip(a[..., 3:] * 2, 0, 255) / 255  # PS2 alpha: 128 = opaque; shown over mid grey
         rgb = a[..., :3] * alpha + 96 * (1 - alpha)
         views.append((rgb @ np.array([0.299, 0.587, 0.114], np.float32), alpha[..., 0]))
