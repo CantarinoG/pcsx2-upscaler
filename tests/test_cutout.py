@@ -70,16 +70,16 @@ class Classifier(unittest.TestCase):
             return material.CutoutClassifier(Path("cutout.onnx"))
 
     def test_probe_and_views(self):
-        classifier = self.load([0.2, 0, 0, 0, 0.8, 0, 0, 0, 0])
+        classifier = self.load([0.2, 0, 0, 0, 0.8, 0, 0, 0, 0, 0, 0, 0])
         self.assertEqual(self.session.run.call_args.args[1][self.session.get_inputs()[0].name].shape[0], 7)
         self.assertEqual(classifier.family(cutout()), "stone")
         self.assertGreaterEqual(self.session.run.call_args.args[1][self.session.get_inputs()[0].name].shape[0], 7)
 
     def test_not_a_surface(self):
-        self.assertIsNone(self.load([0.9, 0, 0, 0, 0.1, 0, 0, 0, 0]).family(cutout()))
+        self.assertIsNone(self.load([0.9, 0, 0, 0, 0.1, 0, 0, 0, 0, 0, 0, 0]).family(cutout()))
 
     def test_only_cutouts_reach_the_model(self):
-        classifier = self.load([0.2, 0, 0, 0, 0.8, 0, 0, 0, 0])
+        classifier = self.load([0.2, 0, 0, 0, 0.8, 0, 0, 0, 0, 0, 0, 0])
         self.session.run.reset_mock()
         self.assertIsNone(classifier.family(surface()))
         self.session.run.assert_not_called()

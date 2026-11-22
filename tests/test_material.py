@@ -21,7 +21,7 @@ class Photos(unittest.TestCase):
 
     def test_every_family_has_several_photos(self):
         for family in material.FAMILIES:
-            self.assertGreaterEqual(len(self.detail.photos[family]), 3, family)
+            self.assertGreaterEqual(len(self.detail.photos[family]), 2, family)
 
     def test_every_folder_is_a_family(self):
         folders = {p.name for p in material.PHOTOS_DIR.iterdir() if p.is_dir()}
@@ -31,7 +31,8 @@ class Photos(unittest.TestCase):
         credits = (material.PHOTOS_DIR / "README.md").read_text()
         for family, photos in self.detail.photos.items():
             for name in photos:
-                self.assertIn(f"polyhaven.com/a/{name})", credits)
+                credit = f"`{name}`" if name.startswith("generated_") else f"polyhaven.com/a/{name})"
+                self.assertIn(credit, credits)
 
     def test_photos_are_square_greyscale_and_tile(self):
         for family, photos in self.detail.photos.items():

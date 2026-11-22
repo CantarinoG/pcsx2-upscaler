@@ -1,6 +1,6 @@
 # pcsx2-upscaler
 
-A workflow that upscales a PCSX2 game's dumped textures 4x and writes them as BC7 `.dds` replacements that PCSX2 loads directly. Textures with text use one model and everything else uses another. Optionally, surfaces such as roads, walls, grass and rock get extra detail from photographed materials.
+A workflow that upscales a PCSX2 game's dumped textures 4x and writes them as BC7 `.dds` replacements that PCSX2 loads directly. Textures with text use one model and everything else uses another. Optionally, surfaces such as roads, walls, grass, rock, cloth and leather get extra detail from photographed materials.
 
 **Bring your own model:** no upscaling models are included. You supply any two 4x ONNX upscalers (or the same one twice), and the workflow handles everything around them: sorting textures by text, edge padding, PS2 alpha, tiling on low VRAM, mipmapped `.dds` output, skips and close-up passes. How good the replacements look depends mostly on the models you choose.
 
@@ -92,12 +92,16 @@ An upscaler can only guess at detail that was never in the dump. With a `models/
 | grass | grass, moss | 3 |
 | wood | wood grain | 3 |
 | metal | sheet metal, rust | 3 |
+| leather | leather, hide | 3 |
+| fur | fur, hair | 2 |
+| cloth | fabric, tarps, awnings | 2 |
 
 - Only the photo's fine luminance detail is used, so colour, shading and layout stay the game's. It backs off on strong edges such as joints and painted lines.
 - Textures with text, flat or black textures, thin strips and textures under 32 px or over 512 px are never touched.
 - Cut-outs (alpha with holes) need `models/cutout.onnx`, see [below](#cut-outs). Without it they're never touched.
 - These surfaces are saved at up to 8x the dump (towards 1024 px on the short side), as the detail needs the room. Those that get the second pass stay at 16x.
 - Each texture gets one of its family's photos, starting at its own offset, both derived from the texture's hash. So textures don't share a visible pattern, a rerun gives the same result, and palette variants of one texture get the same photo and offset.
+- A texture gets one family as a whole, so character sheets that mix skin, hair and clothes aren't split up. Cloth with text on it (banners, printed tarps) gets none, like all text.
 - It's a strong effect by design. Strengths are in `FAMILIES` at the top of `material.py`.
 - It applies to textures as they're upscaled. To add it to existing replacements made by this script, delete those and run again.
 - Without `models/material.onnx` and `models/cutout.onnx` the step is off.
@@ -105,7 +109,7 @@ An upscaler can only guess at detail that was never in the dump. With a `models/
 As with the upscalers, no classifier is included. Any ONNX image classifier with this interface works:
 
 - **Input:** `N x 3 x S x S` float32, RGB in 0–1 (S = 224 unless the model fixes another size). The N images are views of one texture: the texture itself and the texture repeated 2x2. Any normalisation belongs inside the model.
-- **Output:** `1 x 9` probabilities, in this order: not a surface, asphalt, concrete, dirt, stone, masonry, grass, wood, metal. Detail is added when "not a surface" is at most 0.5.
+- **Output:** `1 x 12` probabilities, in this order: not a surface, asphalt, concrete, dirt, stone, masonry, grass, wood, metal, leather, fur, cloth. Detail is added when "not a surface" is at most 0.5.
 
 It runs on the CPU.
 

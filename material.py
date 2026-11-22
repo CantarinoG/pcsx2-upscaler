@@ -1,4 +1,4 @@
-"""Add photographed material detail to upscaled surface textures (roads, walls, grass, rock, ...).
+"""Add photographed material detail to upscaled surface textures (roads, walls, grass, rock, cloth, leather, ...).
 
 An optional ONNX classifier (models/material.onnx, see README) says whether a texture is a surface and of which
 family. A surface gets the fine luminance detail of one of that family's photos (materials/<family>/) laid over its
@@ -30,8 +30,11 @@ FAMILIES = {
     "grass": 0.21,      # grass and moss
     "wood": 0.14,
     "metal": 0.098,
+    "leather": 0.14,
+    "fur": 0.14,        # and hair
+    "cloth": 0.10,      # and tarps, awnings
 }
-DIRECTIONAL = ("wood", "metal")  # the photo is turned to run the way the texture does
+DIRECTIONAL = ("wood", "metal", "fur")  # the photo is turned to run the way the texture does
 SURFACE_MIN = 0.5                # probability of being a surface needed to add detail
 TARGET_SIDE = 1024               # photo grain needs room: surfaces are enlarged towards this short side,
 MIN_SCALE, MAX_SCALE = 4, 8      # within these multiples of the dump
