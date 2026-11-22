@@ -7,7 +7,8 @@ A dump counts as replaced if any file with the same name (any extension) exists 
 replacements/, including texture-pack subfolders, so downloaded packs are never overwritten.
 
 Textures with readable text (signs, logos, UI) go through TEXT_MODEL; everything else through OTHER_MODEL.
-With a MATERIAL_MODEL, those without text that it recognises as surfaces also get photographed detail (material.py).
+With a MATERIAL_MODEL, those without text that it recognises as surfaces also get photographed detail (material.py);
+a CUTOUT_MODEL does the same for the solid parts of cut-outs.
 
 Textures listed in <textures>/<GAME>/skip.txt are never upscaled, and any replacement for them under
 replacements/ (including texture-pack subfolders) is deleted, so the game shows the original. A game can also have
@@ -50,6 +51,7 @@ PLUGIN_CACHE = "plugin_skip.json"  # per game, in USAGE_CACHE: the plugin's answ
 TEXT_MODEL = MODELS_DIR / "text.onnx"   # keeps lettering legible
 OTHER_MODEL = MODELS_DIR / "other.onnx"  # materials, images, foliage, ...
 MATERIAL_MODEL = MODELS_DIR / "material.onnx"  # optional: recognises surfaces, which get detail from materials/
+CUTOUT_MODEL = MODELS_DIR / "cutout.onnx"  # optional: the same for cut-outs, which only get it on their solid parts
 DEFAULT_TEXTURES = Path.home() / ".config" / "PCSX2" / "textures"
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".dds")
 SKIP_FILE = "skip.txt"  # per game: textures to leave unreplaced, one name per line
@@ -493,12 +495,15 @@ def main():
         if not m.exists():
             sys.exit(f"Model not found: {m}  (see README)")
     init_onnxruntime()
-    classifier = detail = None
-    if MATERIAL_MODEL.exists():
+    classifiers, detail = [], None
+    for path, kind in ((MATERIAL_MODEL, material.MaterialClassifier), (CUTOUT_MODEL, material.CutoutClassifier)):
+        if not path.exists():
+            continue
         try:
-            classifier, detail = material.MaterialClassifier(MATERIAL_MODEL), material.MaterialDetail()
+            classifiers.append(kind(path))
+            detail = detail or material.MaterialDetail()
         except Exception as e:
-            sys.exit(f"Material detail can't start ({type(e).__name__}: {e}). Remove {MATERIAL_MODEL} to run without it.")
+            sys.exit(f"Material detail can't start ({type(e).__name__}: {e}). Remove {path} to run without it.")
     cuda = "CUDAExecutionProvider" in ort.get_available_providers()
 
     # Pass 1: sort the textures by whether they contain text.
@@ -519,19 +524,19 @@ def main():
     print(f"\rLooking for text: {len(text)} with text, {len(other)} without "
           f"({time.perf_counter() - t_all:.0f}s).")
     surfaces: dict[Path, str] = {}
-    if classifier:
+    if classifiers:
         try:
             for i, src in enumerate(other, 1):
                 try:
                     with Image.open(src) as im:
-                        if family := classifier.family(im):
+                        if family := next((f for c in classifiers if (f := c.family(im))), None):
                             surfaces[src] = family
                 except Exception as e:
                     print(f"\n  material check failed on {src.name}: {type(e).__name__}: {e}")
                 print(f"\rLooking for surfaces... {i}/{len(other)}", end="", flush=True)
         except KeyboardInterrupt:
             sys.exit("\nAborted.")
-        del classifier
+        classifiers.clear()
         counts = ", ".join(f"{n} {f}" for f, n in collections.Counter(surfaces.values()).most_common())
         print(f"\rLooking for surfaces: {len(surfaces)} get material detail" + (f" ({counts})." if counts else "."))
     print()
@@ -581,7 +586,7 @@ def main():
                                     continue
                         if family := surfaces.get(src):
                             up = detail.apply(up, im.size, family, edge_modes(np.asarray(im.convert("RGBA"))),
-                                              material.texture_key(src.stem))
+                                              material.texture_key(src.stem), mask=material.grain_mask(im))
                             note += f"  (+{family})"
                 except Exception as e:
                     failed += 1

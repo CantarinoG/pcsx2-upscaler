@@ -10,7 +10,7 @@ from unittest import mock
 import numpy as np
 from PIL import Image
 
-from support import dds_levels, surface
+from support import cutout, dds_levels, surface
 
 import material
 import pcsx2_upscale as u
@@ -40,7 +40,7 @@ class Run(unittest.TestCase):
         self.game = root / "textures" / "TEST-00000"
         (self.game / "dumps").mkdir(parents=True)
         (root / "models").mkdir()
-        for name in ("text", "other", "material"):
+        for name in ("text", "other", "material", "cutout"):
             (root / "models" / f"{name}.onnx").touch()
         self.add("aaaa-1111-00000013", surface(64, 64))         # a surface
         self.add("aaaa-2222-00000013", surface(64, 64, seed=2))  # its palette variant
@@ -53,7 +53,7 @@ class Run(unittest.TestCase):
     def size(self, name):
         return u.dds_size(self.game / "replacements" / f"{name}.dds")
 
-    def run_main(self, classifier_error=None):
+    def run_main(self, classifier_error=None, cutout_error=None):
         classified = self.classified = []
 
         class Detector:
@@ -83,14 +83,25 @@ class Run(unittest.TestCase):
                 classified.append(im.width)
                 return "asphalt" if im.width == 64 else None
 
+        class Cutouts:
+            def __init__(self, path):
+                if cutout_error:
+                    raise cutout_error
+
+            def family(self, im):
+                classified.append(im.width)
+                return "stone" if im.width == 96 else None
+
         models = self.root / "models"
         patches = dict(TEXT_MODEL=models / "text.onnx", OTHER_MODEL=models / "other.onnx",
-                       MATERIAL_MODEL=models / "material.onnx", USAGE_CACHE=self.root / "cache",
+                       MATERIAL_MODEL=models / "material.onnx", CUTOUT_MODEL=models / "cutout.onnx",
+                       USAGE_CACHE=self.root / "cache",
                        PLUGINS_DIR=self.root / "plugins", TextDetector=Detector, Upscaler=Upscaler,
                        init_onnxruntime=lambda: None, load_game_titles=lambda textures: {},
                        ProcessPoolExecutor=lambda n, mp_context: ThreadPoolExecutor(2), choose=lambda *a: 0)
         out = io.StringIO()
         with mock.patch.multiple(u, **patches), mock.patch.object(material, "MaterialClassifier", Classifier), \
+                mock.patch.object(material, "CutoutClassifier", Cutouts), \
                 mock.patch.object(material.MaterialDetail, "apply", autospec=True,
                                   side_effect=material.MaterialDetail.apply) as apply, \
                 mock.patch("sys.argv", ["pcsx2_upscale.py", str(self.game.parent)]), contextlib.redirect_stdout(out):
@@ -121,6 +132,7 @@ class Run(unittest.TestCase):
 
     def test_without_a_classifier_everything_is_plain_4x(self):
         (self.root / "models" / "material.onnx").unlink()
+        (self.root / "models" / "cutout.onnx").unlink()
         self.assertNotIn("(+", self.run_main())
         self.assertEqual(self.size("aaaa-1111-00000013"), (256, 256))
 
@@ -128,6 +140,39 @@ class Run(unittest.TestCase):
         with self.assertRaises(SystemExit) as stop:
             self.run_main(classifier_error=ValueError("bad model"))
         self.assertIn("Material detail can't start", str(stop.exception))
+
+    def test_cutout_gets_detail_only_inside(self):
+        self.add("dddd-1111-00000013", cutout(96, 96))
+        out = self.run_main()
+        self.assertIn("5 written, 0 failed", out)
+        self.assertEqual(out.count("(+stone)"), 1)
+        self.assertEqual(self.size("dddd-1111-00000013"), (768, 768))
+        masks = {c.args[-1]: c.kwargs["mask"] for c in self.calls}
+        self.assertIsNone(masks["aaaa"])
+        self.assertEqual((int(masks["dddd"][:, :64].min()), int(masks["dddd"][:, 64:].max())), (1, 0))
+
+    def test_cutout_with_text_is_not_classified(self):
+        self.add("eeee-1111-00000013", cutout(40, 40))
+        self.run_main()
+        self.assertNotIn(40, self.classified)
+
+    def test_each_classifier_works_without_the_other(self):
+        self.add("dddd-1111-00000013", cutout(96, 96))
+        (self.root / "models" / "material.onnx").unlink()
+        out = self.run_main()
+        self.assertEqual((out.count("(+stone)"), out.count("(+asphalt)")), (1, 0))
+
+    def test_without_a_cutout_classifier_cutouts_stay_plain(self):
+        self.add("dddd-1111-00000013", cutout(96, 96))
+        (self.root / "models" / "cutout.onnx").unlink()
+        out = self.run_main()
+        self.assertEqual((out.count("(+stone)"), out.count("(+asphalt)")), (0, 2))
+        self.assertEqual(self.size("dddd-1111-00000013"), (384, 384))
+
+    def test_broken_cutout_classifier_names_its_file(self):
+        with self.assertRaises(SystemExit) as stop:
+            self.run_main(cutout_error=ValueError("bad model"))
+        self.assertIn("cutout.onnx", str(stop.exception))
 
     def test_surface_goes_to_16x_and_back(self):
         name = "aaaa-1111-00000013"

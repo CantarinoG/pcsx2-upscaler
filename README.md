@@ -24,7 +24,7 @@ A workflow that upscales a PCSX2 game's dumped textures 4x and writes them as BC
 
   The thresholds come from a blind A/B test of 50 textures shown at their closest in-game view: below 1.5x magnification 4x and 16x couldn't be told apart, between 1.5x and 3.3x it was a coin toss (and text sometimes looked worse at 16x), and from 3.3x on 16x was preferred 18 times out of 21 and never looked worse. They're `BOOST_MIN_MAG`, `BOOST_MIN_GAIN` and `BOOST_MAX_SIDE` at the top of `pcsx2_upscale.py`.
 - **Text detection:** OCR (RapidOCR with PP-OCRv4, Latin and Chinese) runs on each texture first. A texture counts as text when OCR reads at least 2 characters with confidence ≥ 0.5. On 229 hand-labelled dumps this gave 89% precision and 98% recall; the old "detected text area" approach peaked at about 63% / 81%. The rule favours recall because a general-purpose model tends to garble lettering, while a text-oriented model usually handles any texture well. It runs on the GPU at about 75 ms per texture.
-- **Material detail (optional):** with a `models/material.onnx` classifier (see [below](#material-detail-optional)), textures without text that it recognises as surfaces get the fine detail of a photographed material.
+- **Material detail (optional):** with a `models/material.onnx` classifier (see [below](#material-detail-optional)), textures without text that it recognises as surfaces get the fine detail of a photographed material. A second one, `models/cutout.onnx`, does the same for the solid parts of cut-outs.
 - **Edges:** each texture is padded before upscaling. If its opposite edges match (repeating ground and wall textures), it's padded with them, so the upscale tiles without seams. Otherwise (gradients, shadows, UI bars) it's mirrored, so one edge doesn't bleed into the other.
 - **PS2 alpha:** transparency runs 0–128 on the PS2 (128 = opaque). It stays within each dump's own range:
   - near-uniform alpha is resized normally;
@@ -48,7 +48,7 @@ Put two 4x ONNX upscalers of your choice in `models/` (the file names are set at
 
 The OCR models are downloaded by `rapidocr` on first run.
 
-For material detail, also add `material.onnx` (optional, described below).
+For material detail, also add `material.onnx`, `cutout.onnx` or both (optional, described below).
 
 In PCSX2, under **Settings → Graphics → Texture Replacement**:
 - **Dump Replaceable Textures:** turn on and play, to collect dumps.
@@ -94,12 +94,13 @@ An upscaler can only guess at detail that was never in the dump. With a `models/
 | metal | sheet metal, rust | 3 |
 
 - Only the photo's fine luminance detail is used, so colour, shading and layout stay the game's. It backs off on strong edges such as joints and painted lines.
-- Textures with text, cut-outs, flat or black textures, thin strips and textures under 32 px or over 512 px are never touched.
+- Textures with text, flat or black textures, thin strips and textures under 32 px or over 512 px are never touched.
+- Cut-outs (alpha with holes) need `models/cutout.onnx`, see [below](#cut-outs). Without it they're never touched.
 - These surfaces are saved at up to 8x the dump (towards 1024 px on the short side), as the detail needs the room. Those that get the second pass stay at 16x.
 - Each texture gets one of its family's photos, starting at its own offset, both derived from the texture's hash. So textures don't share a visible pattern, a rerun gives the same result, and palette variants of one texture get the same photo and offset.
 - It's a strong effect by design. Strengths are in `FAMILIES` at the top of `material.py`.
 - It applies to textures as they're upscaled. To add it to existing replacements made by this script, delete those and run again.
-- Without `models/material.onnx` the step is off.
+- Without `models/material.onnx` and `models/cutout.onnx` the step is off.
 
 As with the upscalers, no classifier is included. Any ONNX image classifier with this interface works:
 
@@ -107,6 +108,25 @@ As with the upscalers, no classifier is included. Any ONNX image classifier with
 - **Output:** `1 x 9` probabilities, in this order: not a surface, asphalt, concrete, dirt, stone, masonry, grass, wood, metal. Detail is added when "not a surface" is at most 0.5.
 
 It runs on the CPU.
+
+### Cut-outs
+
+A cut-out's alpha cuts a shape from it: a ragged rock, bark, a fence, a wall with railings. Its outline misleads a classifier made for whole textures, so cut-outs have their own, `models/cutout.onnx` (optional, works with or without `material.onnx`).
+
+- Grain goes on the solid parts only and fades out two texels before the outline. Holes, outline and colour outside get nothing but the enlargement.
+- Cut-outs that are mostly holes (under 10% solid away from the outline) or mostly soft (smoke, glows) aren't asked about.
+- Recognition is far from perfect: expect some fur, soft patches or window glass to get grain. Add a texture to `skip.txt` if one bothers you.
+
+Same output as above. The input is 7 to 9 views of one cut-out, in this order:
+
+| Views | Content |
+|---|---|
+| 0, 1 | holes filled with colour spread from the solid part; the same repeated 2x2 |
+| 2, 3 | holes filled with the nearest solid texel; the same repeated 2x2 |
+| 4, 5 | holes filled with the solid part's mean colour; the same repeated 2x2 |
+| 6 to 8 | up to three squares cut from inside the solid part, largest first |
+
+It runs on the CPU too.
 
 ## Texture usage (optional)
 

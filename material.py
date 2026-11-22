@@ -5,6 +5,9 @@ family. A surface gets the fine luminance detail of one of that family's photos 
 upscale. Which photo, and where it starts, follows from the texture's own hash: textures differ from each other, but
 each gets the same result on every run. Colour, shading and layout stay the texture's own, and the detail backs off
 on strong edges such as joints and painted lines.
+
+Cut-outs (alpha with holes) have a classifier of their own (models/cutout.onnx), as their outline misleads one made
+for whole textures. They only get detail inside their solid parts: holes and outline stay as they are.
 """
 import hashlib
 from pathlib import Path
@@ -33,6 +36,10 @@ SURFACE_MIN = 0.5                # probability of being a surface needed to add 
 TARGET_SIDE = 1024               # photo grain needs room: surfaces are enlarged towards this short side,
 MIN_SCALE, MAX_SCALE = 4, 8      # within these multiples of the dump
 DETAIL_SIZE = 1.2                # detail finer than this many dump texels comes from the photo
+CUTOUT_MIN_CORE = 0.1            # cut-outs: share of the texture that must be solid, away from the outline
+CUTOUT_MIN_HARD = 0.5            # share of the visible part that must be opaque (no smoke, glows, soft shadows)
+CUTOUT_GRAIN_ALPHA = 110         # grain goes where alpha is at least this: solid parts are often a bit below opaque
+CUTOUT_PATCHES = 3               # views from inside the solid part, at most
 LUMA = np.array([0.299, 0.587, 0.114], np.float32)
 
 
@@ -61,16 +68,88 @@ def _seed(*parts: str) -> int:
     return int.from_bytes(hashlib.sha1("/".join(parts).encode()).digest()[:8], "little")
 
 
+def _core(solid: np.ndarray) -> np.ndarray:
+    """The solid part without its outline, two texels in."""
+    return cv2.erode(solid, np.ones((5, 5), np.uint8), borderType=cv2.BORDER_REPLICATE)
+
+
+def cutout_core(dump: Image.Image) -> np.ndarray | None:
+    """A cut-out's solid part if the cut-out classifier is to be asked about it, else None: not a cut-out, a bad
+    size, mostly holes, soft, or flat."""
+    w, h = dump.size
+    if min(w, h) < 32 or max(w, h) > 512 or max(w, h) > 4 * min(w, h):
+        return None
+    rgba = np.asarray(dump.convert("RGBA"))
+    alpha = rgba[..., 3]
+    if not dds.is_cutout(alpha):
+        return None
+    solid = (alpha >= dds.CUTOUT_OPAQUE).astype(np.uint8)
+    core = _core(solid)
+    if core.mean() < CUTOUT_MIN_CORE or solid.sum() < CUTOUT_MIN_HARD * (alpha > dds.CUTOUT_CLEAR).sum():
+        return None
+    y = rgba[..., :3].astype(np.float32) @ LUMA
+    return core if y[core > 0].std() >= 2 else None
+
+
+def grain_mask(dump: Image.Image) -> np.ndarray | None:
+    """Where a cut-out may get grain, None for other textures."""
+    alpha = np.asarray(dump.convert("RGBA"))[..., 3]
+    return (alpha >= CUTOUT_GRAIN_ALPHA).astype(np.uint8) if dds.is_cutout(alpha) else None
+
+
+def cutout_views(dump: Image.Image, core: np.ndarray) -> list[Image.Image]:
+    """What the cut-out classifier sees, outline removed in different ways: holes filled with spread colour, with
+    the nearest solid texel and with the mean colour (each also repeated 2x2), then squares from inside."""
+    rgb = np.asarray(dump.convert("RGB"))
+    inside = core > 0
+
+    weight = core.astype(np.float32)
+    colour = rgb.astype(np.float32) * weight[..., None]
+    spread, done = colour.copy(), inside.copy()
+    for sigma in (1, 2, 4, 8, 16, 32, 64, 128):
+        share = cv2.GaussianBlur(weight, (0, 0), sigma)
+        blurred = cv2.GaussianBlur(colour, (0, 0), sigma)
+        new = ~done & (share > 0.01)
+        spread[new] = blurred[new] / share[new][:, None]
+        done |= new
+
+    labels = cv2.distanceTransformWithLabels((~inside).astype(np.uint8), cv2.DIST_L2, 5,
+                                             labelType=cv2.DIST_LABEL_PIXEL)[1]
+    colours = np.zeros((labels.max() + 1, 3), np.uint8)
+    colours[labels[inside]] = rgb[inside]
+
+    flat = rgb.copy()
+    flat[~inside] = rgb[inside].mean(0).astype(np.uint8)
+
+    views = []
+    for filled in (np.clip(spread + 0.5, 0, 255).astype(np.uint8), colours[labels], flat):
+        views += [Image.fromarray(filled), Image.fromarray(np.tile(filled, (2, 2, 1)))]
+
+    free, opaque = core.copy(), Image.fromarray(rgb)
+    for i in range(CUTOUT_PATCHES):  # each the largest square left
+        room = cv2.distanceTransform(np.pad(free, 1), cv2.DIST_C, 3)[1:-1, 1:-1]
+        y, x = np.unravel_index(room.argmax(), room.shape)
+        r = int(room[y, x]) - 1
+        if r < 4 and i:
+            break
+        r = max(r, 1)
+        views.append(opaque.crop((x - r, y - r, x + r + 1, y + r + 1)))
+        free[max(0, y - r):y + r + 1, max(0, x - r):x + r + 1] = 0
+    return views
+
+
 class MaterialClassifier:
     """Input: N x 3 x S x S RGB in 0..1, N views of one texture. Output: 1 x (1 + len(FAMILIES)) probabilities,
     "not a surface" followed by FAMILIES."""
+
+    PROBE_VIEWS = 2  # how many views the model is tried with on loading
 
     def __init__(self, path: Path):
         self.sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
         self.input = self.sess.get_inputs()[0]
         side = self.input.shape[-1]
         self.side = side if isinstance(side, int) else 224
-        out = self._run(np.zeros((2, 3, self.side, self.side), np.float32))
+        out = self._run(np.zeros((self.PROBE_VIEWS, 3, self.side, self.side), np.float32))
         if out.shape != (1, len(FAMILIES) + 1):
             raise ValueError(f"{path.name} outputs {out.shape}, expected (1, {len(FAMILIES) + 1}); see README")
 
@@ -87,13 +166,25 @@ class MaterialClassifier:
         for x in (0, w):
             for y in (0, h):
                 repeated.paste(rgb, (x, y))
+        return self._decide([rgb, repeated])
+
+    def _decide(self, images: list[Image.Image]) -> str | None:
         size = (self.side, self.side)
-        views = np.stack([np.asarray(v.resize(size, Image.Resampling.BICUBIC), np.float32) / 255
-                          for v in (rgb, repeated)])
+        views = np.stack([np.asarray(v.resize(size, Image.Resampling.BICUBIC), np.float32) / 255 for v in images])
         prob = self._run(views.transpose(0, 3, 1, 2))[0]
         if 1 - prob[0] < SURFACE_MIN:
             return None
         return list(FAMILIES)[int(prob[1:].argmax())]
+
+
+class CutoutClassifier(MaterialClassifier):
+    """Like MaterialClassifier, for cut-outs. Input: the 7 to 9 views of cutout_views, in that order."""
+
+    PROBE_VIEWS = 7
+
+    def family(self, dump: Image.Image) -> str | None:
+        core = cutout_core(dump)
+        return None if core is None else self._decide(cutout_views(dump, core))
 
 
 def _pad(a: np.ndarray, n: int, modes: tuple[str, str]) -> np.ndarray:
@@ -154,9 +245,9 @@ class MaterialDetail:
         return np.asarray(covered, np.float32)
 
     def apply(self, up: Image.Image, dump_size: tuple[int, int], family: str, modes: tuple[str, str],
-              key: str) -> Image.Image:
+              key: str, mask: np.ndarray | None = None) -> Image.Image:
         """up: the upscale (4x, or 16x from the second pass). modes: the texture's edge padding, see edge_modes.
-        key: see texture_key."""
+        key: see texture_key. mask: for cut-outs, see grain_mask."""
         sw, sh = dump_size
         scale = max(up.width // sw, output_scale(sw, sh))
         size = (sw * scale, sh * scale)
@@ -174,6 +265,11 @@ class MaterialDetail:
 
         out = rgb * np.exp(detail * FAMILIES[family] * keep)[..., None]
         out = np.clip(out + 0.5, 0, 255).astype(np.uint8)
+        if mask is not None:  # fades out before the outline and never reaches past the solid part
+            inner = cv2.resize(_core(mask).astype(np.float32), size)
+            inner = cv2.GaussianBlur(inner, (0, 0), scale * 0.6, borderType=cv2.BORDER_REPLICATE)
+            weight = (inner * (cv2.resize(mask.astype(np.float32), size) >= 0.999))[..., None]
+            out = np.clip(rgb * (1 - weight) + out * weight + 0.5, 0, 255).astype(np.uint8)
         if "A" not in up.getbands():
             return Image.fromarray(out, "RGB")
         # alpha is resized by itself (Pillow would weight colour by it) and, being PS2 alpha, kept in its range

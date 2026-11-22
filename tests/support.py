@@ -18,6 +18,13 @@ def surface(w=64, h=64, channels=3, seed=1, alpha=128) -> Image.Image:
     return Image.fromarray(a)
 
 
+def cutout(w=64, h=64, seed=1, solid=128) -> Image.Image:
+    """A surface with a hole down its right third."""
+    a = np.array(surface(w, h, 4, seed, solid))
+    a[:, w - w // 3:, 3] = 0
+    return Image.fromarray(a)
+
+
 def dds_levels(data: bytes) -> list[np.ndarray]:
     """The levels of a .dds written by dds.save_dds that are at least 4x4."""
     h, w = struct.unpack_from("<II", data, 12)
