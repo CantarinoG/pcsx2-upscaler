@@ -185,6 +185,93 @@ class Run(unittest.TestCase):
         self.assertIn("(+asphalt)", self.run_main())
         self.assertEqual(self.size(name), (512, 512))
 
+    def detail_txt(self, text):
+        (self.game / "detail.txt").write_text(text)
+
+    def details(self, out):
+        """texture -> the material its line in the run's output names, or None."""
+        found = {}
+        for line in out.splitlines():
+            m = u.re.search(r"\] (\S+?)\.png .*?(?:\(\+(\w+)\))?$", line)
+            if m and " ms" in line:
+                found[m[1]] = m[2]
+        return found
+
+    def test_material_set_by_hand(self):
+        self.detail_txt("# comment\nbbbb-1111-00000013 wood  # was not a surface\n"
+                        "replacements/x/aaaa-1111-00000013.dds NONE\ncccc-1111-00000013.png cloth\n")
+        found = self.details(self.run_main())
+        self.assertEqual(found, {"aaaa-1111-00000013": None, "aaaa-2222-00000013": "asphalt",
+                                 "bbbb-1111-00000013": "wood", "cccc-1111-00000013": "cloth"})
+        self.assertEqual(self.classified.count(64), 1, "listed textures aren't classified")
+        self.assertEqual(self.size("bbbb-1111-00000013"), (384, 384))
+
+    def test_patterns_and_exact_names(self):
+        self.detail_txt("aaaa-* none\n*-00000013 metal\naaaa-2222-00000013 grass\n")
+        found = self.details(self.run_main())
+        self.assertEqual(found, {"aaaa-1111-00000013": None, "aaaa-2222-00000013": "grass",
+                                 "bbbb-1111-00000013": "metal", "cccc-1111-00000013": "metal"})
+        self.assertEqual(self.classified, [], "every texture is listed")
+
+    def test_works_without_classifiers(self):
+        for name in ("material", "cutout"):
+            (self.root / "models" / f"{name}.onnx").unlink()
+        self.detail_txt("bbbb-1111-00000013 stone\n")
+        self.assertEqual(self.details(self.run_main())["bbbb-1111-00000013"], "stone")
+
+    def test_cutout_set_by_hand_keeps_its_holes(self):
+        self.add("dddd-1111-00000013", cutout(96, 96))
+        self.detail_txt("dddd-1111-00000013 wood\n")
+        self.run_main()
+        mask = next(c.kwargs["mask"] for c in self.calls if c.args[-1] == "dddd")
+        self.assertEqual((int(mask[:, :64].min()), int(mask[:, 64:].max())), (1, 0))
+
+    def test_unknown_material_stops_with_the_line(self):
+        self.detail_txt("aaaa-1111-00000013 wood\nbbbb-1111-00000013 plastic\n")
+        with self.assertRaises(SystemExit) as stop:
+            self.run_main()
+        self.assertIn("line 2", str(stop.exception))
+        self.assertFalse((self.game / "replacements").exists())
+
+    def test_changed_entries_are_redone_and_nothing_else(self):
+        repl = self.game / "replacements"
+        self.run_main()
+        files = lambda: {p.name: p.read_bytes() for p in repl.iterdir()}
+        first = files()
+        self.detail_txt("aaaa-1111-00000013 wood\n")
+        self.assertEqual(self.details(self.run_main()), {"aaaa-1111-00000013": "wood"})
+        second = files()
+        self.assertNotEqual(second["aaaa-1111-00000013.dds"], first["aaaa-1111-00000013.dds"])
+        self.assertEqual({k: v for k, v in second.items() if k != "aaaa-1111-00000013.dds"},
+                         {k: v for k, v in first.items() if k != "aaaa-1111-00000013.dds"})
+        self.assertEqual(self.details(self.run_main()), {}, "an unchanged list redoes nothing")
+        self.detail_txt("aaaa-1111-00000013 metal\n")
+        self.assertEqual(self.details(self.run_main()), {"aaaa-1111-00000013": "metal"})
+        (self.game / "detail.txt").unlink()
+        self.assertEqual(self.details(self.run_main()), {"aaaa-1111-00000013": "asphalt"}, "back to automatic")
+        self.assertEqual(files(), first)
+        self.assertEqual(self.details(self.run_main()), {})
+
+    def test_listing_a_texture_made_earlier_redoes_it(self):
+        self.run_main()
+        (self.root / "cache").joinpath("TEST-00000", "detail.json").unlink()  # made before detail.txt existed
+        self.detail_txt("bbbb-1111-00000013 none\n")
+        self.assertEqual(self.details(self.run_main()), {"bbbb-1111-00000013": None})
+
+    def test_pack_files_are_never_redone(self):
+        pack = self.game / "replacements" / "pack"
+        pack.mkdir(parents=True)
+        (pack / "aaaa-1111-00000013.dds").write_bytes(b"pack")
+        self.detail_txt("aaaa-1111-00000013 wood\n")
+        found = self.details(self.run_main())
+        self.assertNotIn("aaaa-1111-00000013", found)
+        self.assertEqual((pack / "aaaa-1111-00000013.dds").read_bytes(), b"pack")
+
+    def test_skip_wins_over_detail(self):
+        (self.game / "skip.txt").write_text("bbbb-1111-00000013\n")
+        self.detail_txt("bbbb-1111-00000013 wood\n")
+        self.assertNotIn("bbbb-1111-00000013", self.details(self.run_main()))
+
     def test_skipped_textures_are_left_unreplaced(self):
         (self.game / "skip.txt").write_text("bbbb-*\n")
         self.run_main()

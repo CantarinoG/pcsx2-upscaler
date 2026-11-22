@@ -8,7 +8,8 @@ replacements/, including texture-pack subfolders, so downloaded packs are never 
 
 Textures with readable text (signs, logos, UI) go through TEXT_MODEL; everything else through OTHER_MODEL.
 With a MATERIAL_MODEL, those without text that it recognises as surfaces also get photographed detail (material.py);
-a CUTOUT_MODEL does the same for the solid parts of cut-outs.
+a CUTOUT_MODEL does the same for the solid parts of cut-outs. <textures>/<GAME>/detail.txt sets the material of
+listed textures by hand (or none), whatever the classifiers say.
 
 Textures listed in <textures>/<GAME>/skip.txt are never upscaled, and any replacement for them under
 replacements/ (including texture-pack subfolders) is deleted, so the game shows the original. A game can also have
@@ -55,6 +56,8 @@ CUTOUT_MODEL = MODELS_DIR / "cutout.onnx"  # optional: the same for cut-outs, wh
 DEFAULT_TEXTURES = Path.home() / ".config" / "PCSX2" / "textures"
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".dds")
 SKIP_FILE = "skip.txt"  # per game: textures to leave unreplaced, one name per line
+DETAIL_FILE = "detail.txt"  # per game: "<texture> <material or none>" per line, overrides the classifiers
+DETAIL_RECORD = "detail.json"  # per game, in USAGE_CACHE: the detail each of this script's replacements got
 USAGE_FILE = "usage.json"  # per game: how often each texture is drawn, written by texture_usage.py
 USAGE_CACHE = Path.home() / ".cache" / "pcsx2-upscaler" / "usage"
 # Second 4x pass (16x in total). Thresholds from a blind A/B test of 50 textures at their closest in-game view:
@@ -244,6 +247,16 @@ class SkipList:
         return " and ".join(parts)
 
 
+def _texture_name(entry: str) -> str:
+    """A texture as named in skip.txt or detail.txt (hash, file name or path; any extension) -> its dump name."""
+    name = Path(entry).name
+    return Path(name).stem if Path(name).suffix.lower() in IMAGE_EXTS else name
+
+
+def _is_pattern(name: str) -> bool:
+    return any(c in name for c in "*?[")
+
+
 def load_skip_list(game: Path) -> SkipList:
     """Texture names (hash, file name or path; any extension) listed in <game>/skip.txt. '#' starts a comment.
     Lines with wildcards (*, ?, [...]) are patterns, e.g. *-8000264a skips every texture whose name ends that way."""
@@ -253,13 +266,75 @@ def load_skip_list(game: Path) -> SkipList:
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.split("#", 1)[0].strip()
             if line:
-                name = Path(line).name
-                name = Path(name).stem if Path(name).suffix.lower() in IMAGE_EXTS else name
-                if any(c in name for c in "*?["):
+                name = _texture_name(line)
+                if _is_pattern(name):
                     patterns.append(name)
                 else:
                     names.add(name)
     return SkipList(names, patterns)
+
+
+class DetailList:
+    """Materials set by hand in detail.txt: texture -> family, or None for no detail. A name listed exactly wins over
+    patterns; among patterns, the first that matches wins."""
+
+    def __init__(self, names: dict[str, str | None], patterns: list[tuple[str, str | None]]):
+        self.names = names
+        self.patterns = [(re.compile(fnmatch.translate(p)), p, f) for p, f in patterns]
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.names or any(r.match(name) for r, _, _ in self.patterns)
+
+    def __getitem__(self, name: str) -> str | None:
+        if name in self.names:
+            return self.names[name]
+        return next(f for r, _, f in self.patterns if r.match(name))
+
+    def __bool__(self) -> bool:
+        return bool(self.names or self.patterns)
+
+    def __str__(self) -> str:
+        n = len(self.names) + len(self.patterns)
+        return f"{n} material{'s' * (n != 1)} set by hand"
+
+
+def load_detail_list(game: Path) -> DetailList:
+    """<game>/detail.txt: per line a texture (as in skip.txt, patterns too) and a material family or "none".
+    '#' starts a comment. Raises ValueError, naming the line, for a material that doesn't exist."""
+    path = game / DETAIL_FILE
+    names, patterns = {}, []
+    if path.is_file():
+        for n, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            words = line.split("#", 1)[0].split()
+            if not words:
+                continue
+            if len(words) != 2 or (words[1].lower() not in material.FAMILIES and words[1].lower() != "none"):
+                raise ValueError(f"line {n}: expected a texture and one of {', '.join(material.FAMILIES)} or none, "
+                                 f"got {line.strip()!r}")
+            name, family = _texture_name(words[0]), words[1].lower()
+            family = None if family == "none" else family
+            if _is_pattern(name):
+                patterns.append((name, family))
+            else:
+                names[name] = family
+    return DetailList(names, patterns)
+
+
+def detail_changed(dumps: list[Path], repl_dir: Path, skip: SkipList, listed: DetailList,
+                   record: dict) -> list[Path]:
+    """This script's replacements (replacements/<name>.dds, never pack files) to redo because detail.txt changed:
+    listed with another material than they got, or no longer listed after getting theirs by hand."""
+    redo = []
+    for src in dumps:
+        if src.stem in skip or not (repl_dir / f"{src.stem}.dds").is_file():
+            continue
+        was = record.get(src.stem) or {}
+        if src.stem in listed:
+            if not was.get("forced") or was.get("family") != listed[src.stem]:
+                redo.append(src)
+        elif was.get("forced"):
+            redo.append(src)
+    return redo
 
 
 def load_plugin(game: Path):
@@ -424,10 +499,11 @@ def retry_rejected(rejected: dict, name: str, mag: float) -> bool:
     return not isinstance(entry, dict) or mag >= entry.get("mag", 0.0) * BOOST_RETRY_MAG
 
 
-def save_rejected(path: Path, rejected: dict):
-    if rejected:
+def save_json(path: Path, data: dict):
+    """Saves a per-game cache file (boost_rejected.json, detail.json), unless there's nothing in it."""
+    if data:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(rejected, indent=1, sort_keys=True))
+        path.write_text(json.dumps(data, indent=1, sort_keys=True))
 
 
 def choose(prompt: str, options: list[str]) -> int:
@@ -472,6 +548,19 @@ def main():
     replaced = {p.stem for p in repl_dir.rglob("*") if p.is_file()} if repl_dir.is_dir() else set()
     skipped = [p for p in dumps if p.stem in skip]
     new = [p for p in dumps if p.stem not in replaced and p.stem not in skip]
+    try:
+        listed = load_detail_list(game)
+    except ValueError as e:
+        sys.exit(f"{game / DETAIL_FILE}: {e}")
+    if listed:
+        print(f"{DETAIL_FILE}: {listed}.")
+    record_file = USAGE_CACHE / game.name / DETAIL_RECORD
+    try:
+        record = json.loads(record_file.read_text())
+    except (OSError, ValueError):
+        record = {}
+    redo = detail_changed(dumps, repl_dir, skip, listed, record)  # redone like new ones
+    new += redo
     rejected_file = USAGE_CACHE / game.name / BOOST_REJECTED
     try:
         rejected = json.loads(rejected_file.read_text())
@@ -481,6 +570,8 @@ def main():
     boost, downgrade = plan_second_pass(game, dumps, repl_dir, skip, new_set, rejected)
     print(f"\n{titles.get(game.name, game.name)}: {len(dumps)} dumps, {len(dumps) - len(new) - len(skipped)} already "
           f"replaced, {len(skipped)} skipped, {len(new)} to upscale.")
+    if redo:
+        print(f"{DETAIL_FILE}: {len(redo)} of them are redone with the material it now sets.")
     if boost:
         print(f"{USAGE_FILE}: {len(boost)} close-up textures get a second 4x pass (16x), kept if it adds detail.")
     if downgrade:
@@ -504,6 +595,12 @@ def main():
             detail = detail or material.MaterialDetail()
         except Exception as e:
             sys.exit(f"Material detail can't start ({type(e).__name__}: {e}). Remove {path} to run without it.")
+    forced = {src: listed[src.stem] for src in todo if src.stem in listed}
+    if any(forced.values()) and detail is None:
+        try:
+            detail = material.MaterialDetail()
+        except Exception as e:
+            sys.exit(f"Material detail can't start ({type(e).__name__}: {e}). Remove {DETAIL_FILE} to run without it.")
     cuda = "CUDAExecutionProvider" in ort.get_available_providers()
 
     # Pass 1: sort the textures by whether they contain text.
@@ -523,17 +620,20 @@ def main():
     del detector
     print(f"\rLooking for text: {len(text)} with text, {len(other)} without "
           f"({time.perf_counter() - t_all:.0f}s).")
-    surfaces: dict[Path, str] = {}
+    surfaces: dict[Path, str] = {src: family for src, family in forced.items() if family}
+    if forced:
+        print(f"{DETAIL_FILE}: {len(surfaces)} get the material set there, {len(forced) - len(surfaces)} none.")
+    other_auto = [src for src in other if src not in forced]  # text never gets detail unless set by hand
     if classifiers:
         try:
-            for i, src in enumerate(other, 1):
+            for i, src in enumerate(other_auto, 1):
                 try:
                     with Image.open(src) as im:
                         if family := next((f for c in classifiers if (f := c.family(im))), None):
                             surfaces[src] = family
                 except Exception as e:
                     print(f"\n  material check failed on {src.name}: {type(e).__name__}: {e}")
-                print(f"\rLooking for surfaces... {i}/{len(other)}", end="", flush=True)
+                print(f"\rLooking for surfaces... {i}/{len(other_auto)}", end="", flush=True)
         except KeyboardInterrupt:
             sys.exit("\nAborted.")
         classifiers.clear()
@@ -553,6 +653,7 @@ def main():
             src = pending.pop(fut)
             if fut.exception() is None:
                 converted += 1
+                record[src.stem] = {"family": surfaces.get(src), "forced": src in forced}
             else:
                 failed += 1
                 print(f"  {src.name}  .dds FAILED: {fut.exception()!r}")
@@ -604,10 +705,12 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted. Finished textures are kept; run again to continue.")
         pool.shutdown(wait=True, cancel_futures=True)
-        save_rejected(rejected_file, rejected)
+        save_json(rejected_file, rejected)
+        save_json(record_file, record)
         sys.exit(1)
     pool.shutdown()
-    save_rejected(rejected_file, rejected)
+    save_json(rejected_file, rejected)
+    save_json(record_file, record)
     print(f"\nDone in {time.perf_counter() - t_all:.0f}s: {converted} written, {failed} failed.")
     print(f"Replacements: {repl_dir}")
 

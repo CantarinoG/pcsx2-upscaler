@@ -103,7 +103,7 @@ An upscaler can only guess at detail that was never in the dump. With a `models/
 - Each texture gets one of its family's photos, starting at its own offset, both derived from the texture's hash. So textures don't share a visible pattern, a rerun gives the same result, and palette variants of one texture get the same photo and offset.
 - A texture gets one family as a whole, so character sheets that mix skin, hair and clothes aren't split up. Cloth with text on it (banners, printed tarps) gets none, like all text.
 - It's a strong effect by design. Strengths are in `FAMILIES` at the top of `material.py`.
-- It applies to textures as they're upscaled. To add it to existing replacements made by this script, delete those and run again.
+- It applies to textures as they're upscaled. To add it to existing replacements made by this script, delete those and run again. Textures whose entry in `detail.txt` (below) changes are redone by themselves.
 - Without `models/material.onnx` and `models/cutout.onnx` the step is off.
 
 As with the upscalers, no classifier is included. Any ONNX image classifier with this interface works:
@@ -113,13 +113,29 @@ As with the upscalers, no classifier is included. Any ONNX image classifier with
 
 It runs on the CPU.
 
+### Choosing the material by hand
+
+Create `<textures>/<GAME>/detail.txt` with a texture and a material per line, to fix what the classifiers get wrong. Textures are named as in `skip.txt` (patterns too), and the material is one of the families above or `none`:
+
+```
+# a wooden crate taken for metal
+1357f3a2c0de5b11-77aa0c12d4e9f3b0-00001994 wood
+# no grain on these smooth panels
+*-00002213 none
+```
+
+- Listed textures skip the classifiers: they get that material, or no detail with `none`. This works without the classifier models too, and also on textures with text and on cut-outs.
+- A name listed exactly wins over patterns; among patterns, the first that matches wins.
+- On the next run, this script's replacements of textures whose entry was added, changed or removed are redone (what each got is kept in `~/.cache/pcsx2-upscaler/usage/<GAME>/detail.json`). Pack files are never touched.
+- An unknown material stops the run with the line it's on.
+
 ### Cut-outs
 
 A cut-out's alpha cuts a shape from it: a ragged rock, bark, a fence, a wall with railings. Its outline misleads a classifier made for whole textures, so cut-outs have their own, `models/cutout.onnx` (optional, works with or without `material.onnx`).
 
 - Grain goes on the solid parts only and fades out two texels before the outline. Holes, outline and colour outside get nothing but the enlargement.
 - Cut-outs that are mostly holes (under 10% solid away from the outline) or mostly soft (smoke, glows) aren't asked about.
-- Recognition is far from perfect: expect some fur, soft patches or window glass to get grain. Add a texture to `skip.txt` if one bothers you.
+- Recognition is far from perfect: expect some fur, soft patches or window glass to get grain. Add a texture to `detail.txt` with `none` (or the right material) if one bothers you.
 
 Same output as above. The input is 7 to 9 views of one cut-out, in this order:
 
