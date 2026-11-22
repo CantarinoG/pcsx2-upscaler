@@ -15,14 +15,14 @@ DDSD_MIPMAPCOUNT, DDSD_LINEARSIZE = 0x20000, 0x80000
 DDSCAPS_COMPLEX, DDSCAPS_TEXTURE, DDSCAPS_MIPMAP = 0x8, 0x1000, 0x400000
 DDPF_FOURCC = 0x4
 D3D10_RESOURCE_DIMENSION_TEXTURE2D = 3
-# PS2 alpha (128 = opaque) is often not opacity but data, e.g. a gloss mask on roads. See _is_cutout.
+# PS2 alpha (128 = opaque) is often not opacity but data, e.g. a gloss mask on roads. See is_cutout.
 CUTOUT_CLEAR = 2         # alpha up to this is a hole
 CUTOUT_OPAQUE = 124      # alpha from this is opaque
 CUTOUT_MIN_HOLES = 0.01  # share of pixels that are holes
 CUTOUT_MIN_SOLID = 0.001 # share of pixels that are opaque; low, as upscaling softens thin shapes
 
 
-def _is_cutout(alpha: np.ndarray) -> bool:
+def is_cutout(alpha: np.ndarray) -> bool:
     """Whether alpha is a cut-out mask: it has both holes and fully opaque pixels. Data masks seldom have both."""
     holes, opaque = (alpha <= CUTOUT_CLEAR).mean(), (alpha >= CUTOUT_OPAQUE).mean()
     return bool(holes >= CUTOUT_MIN_HOLES and opaque >= CUTOUT_MIN_SOLID)
@@ -37,7 +37,7 @@ def _mip_chain(img: Image.Image) -> list[Image.Image]:
     weighted by alpha, so hidden colour doesn't bleed into their edges."""
     rgba = np.asarray(img, np.float32)
     channels = [rgba[..., i] for i in range(4)]  # R, G, B, A, then R*A, G*A, B*A for cut-outs
-    cutout = _is_cutout(rgba[..., 3])
+    cutout = is_cutout(rgba[..., 3])
     if cutout:
         channels += [rgba[..., i] * rgba[..., 3] for i in range(3)]
     planes = [Image.fromarray(c) for c in channels]

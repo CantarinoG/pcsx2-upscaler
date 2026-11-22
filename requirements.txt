@@ -3,3 +3,4 @@ numpy
 pillow
 etcpak            # BC7 encoder
 rapidocr          # text detection (OCR); uses the onnxruntime above
+opencv-python-headless  # material detail filters

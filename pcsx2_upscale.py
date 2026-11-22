@@ -7,6 +7,7 @@ A dump counts as replaced if any file with the same name (any extension) exists 
 replacements/, including texture-pack subfolders, so downloaded packs are never overwritten.
 
 Textures with readable text (signs, logos, UI) go through TEXT_MODEL; everything else through OTHER_MODEL.
+With a MATERIAL_MODEL, those without text that it recognises as surfaces also get photographed detail (material.py).
 
 Textures listed in <textures>/<GAME>/skip.txt are never upscaled, and any replacement for them under
 replacements/ (including texture-pack subfolders) is deleted, so the game shows the original. A game can also have
@@ -39,6 +40,7 @@ import onnxruntime as ort
 from PIL import Image
 
 import dds
+import material
 from textdet import TextDetector
 
 ROOT = Path(__file__).resolve().parent
@@ -47,6 +49,7 @@ PLUGINS_DIR = ROOT / "plugins"  # per game: <GAME>.py with game-specific rules
 PLUGIN_CACHE = "plugin_skip.json"  # per game, in USAGE_CACHE: the plugin's answers per dump
 TEXT_MODEL = MODELS_DIR / "text.onnx"   # keeps lettering legible
 OTHER_MODEL = MODELS_DIR / "other.onnx"  # materials, images, foliage, ...
+MATERIAL_MODEL = MODELS_DIR / "material.onnx"  # optional: recognises surfaces, which get detail from materials/
 DEFAULT_TEXTURES = Path.home() / ".config" / "PCSX2" / "textures"
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".dds")
 SKIP_FILE = "skip.txt"  # per game: textures to leave unreplaced, one name per line
@@ -399,8 +402,9 @@ def plan_second_pass(game: Path, dumps: list[Path], repl_dir: Path, skip: SkipLi
             w, h = (sw * 4, sh * 4) if src in new else dds_size(repl)
         except Exception:
             continue
-        if (w, h) == (sw * 4, sh * 4):
-            if m >= BOOST_MIN_MAG and max(w, h) <= BOOST_MAX_SIDE and retry_rejected(rejected, src.stem, m):
+        detailed = material.output_scale(sw, sh)  # surfaces with material detail are saved at this scale
+        if (w, h) in ((sw * 4, sh * 4), (sw * detailed, sh * detailed)):
+            if m >= BOOST_MIN_MAG and max(sw, sh) * 4 <= BOOST_MAX_SIDE and retry_rejected(rejected, src.stem, m):
                 boost[src] = m
         elif (w, h) == (sw * 16, sh * 16) and m < BOOST_MIN_MAG:
             downgrade.append(src)
@@ -487,6 +491,12 @@ def main():
         if not m.exists():
             sys.exit(f"Model not found: {m}  (see README)")
     init_onnxruntime()
+    classifier = detail = None
+    if MATERIAL_MODEL.exists():
+        try:
+            classifier, detail = material.MaterialClassifier(MATERIAL_MODEL), material.MaterialDetail()
+        except Exception as e:
+            sys.exit(f"Material detail can't start ({type(e).__name__}: {e}). Remove {MATERIAL_MODEL} to run without it.")
     cuda = "CUDAExecutionProvider" in ort.get_available_providers()
 
     # Pass 1: sort the textures by whether they contain text.
@@ -505,7 +515,24 @@ def main():
         sys.exit("\nAborted.")
     del detector
     print(f"\rLooking for text: {len(text)} with text, {len(other)} without "
-          f"({time.perf_counter() - t_all:.0f}s).\n")
+          f"({time.perf_counter() - t_all:.0f}s).")
+    surfaces: dict[Path, str] = {}
+    if classifier:
+        try:
+            for i, src in enumerate(other, 1):
+                try:
+                    with Image.open(src) as im:
+                        if family := classifier.family(im):
+                            surfaces[src] = family
+                except Exception as e:
+                    print(f"\n  material check failed on {src.name}: {type(e).__name__}: {e}")
+                print(f"\rLooking for surfaces... {i}/{len(other)}", end="", flush=True)
+        except KeyboardInterrupt:
+            sys.exit("\nAborted.")
+        del classifier
+        counts = ", ".join(f"{n} {f}" for f, n in collections.Counter(surfaces.values()).most_common())
+        print(f"\rLooking for surfaces: {len(surfaces)} get material detail" + (f" ({counts})." if counts else "."))
+    print()
     repl_dir.mkdir(exist_ok=True)
 
     # BC7 encoding runs in worker processes so it overlaps with GPU upscaling ("spawn": no inherited CUDA state).
@@ -550,6 +577,9 @@ def main():
                                     print(f"  [{n}/{len(todo)}] {src.name}{note}  "
                                           f"{(time.perf_counter() - t0) * 1000:.0f} ms")
                                     continue
+                        if family := surfaces.get(src):
+                            up = detail.apply(up, im.size, family, edge_modes(np.asarray(im.convert("RGBA"))))
+                            note += f"  (+{family})"
                 except Exception as e:
                     failed += 1
                     print(f"  [{n}/{len(todo)}] {src.name}  FAILED: {type(e).__name__}: {e}")

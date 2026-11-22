@@ -1,6 +1,6 @@
 # pcsx2-upscaler
 
-A workflow that upscales a PCSX2 game's dumped textures 4x and writes them as BC7 `.dds` replacements that PCSX2 loads directly. Textures with text use one model and everything else uses another.
+A workflow that upscales a PCSX2 game's dumped textures 4x and writes them as BC7 `.dds` replacements that PCSX2 loads directly. Textures with text use one model and everything else uses another. Optionally, surfaces such as roads, walls, grass and rock get extra detail from photographed materials.
 
 **Bring your own model:** no upscaling models are included. You supply any two 4x ONNX upscalers (or the same one twice), and the workflow handles everything around them: sorting textures by text, edge padding, PS2 alpha, tiling on low VRAM, mipmapped `.dds` output, skips and close-up passes. How good the replacements look depends mostly on the models you choose.
 
@@ -8,6 +8,7 @@ A workflow that upscales a PCSX2 game's dumped textures 4x and writes them as BC
                                      ┌─ has text ─► text model ──┐
 <textures>/<GAME>/dumps/<hash>.png ──┤                           ├─► BC7 .dds + mipmaps ─► <textures>/<GAME>/replacements/<hash>.dds
                                      └─ no text ──► other model ─┘
+                                                     (+ photographed detail on surfaces, optional)
 ```
 
 ![Before and after: a graffiti-covered wall, a logo and a brick facade from Need for Speed: Underground](docs/comparison.jpg)
@@ -23,6 +24,7 @@ A workflow that upscales a PCSX2 game's dumped textures 4x and writes them as BC
 
   The thresholds come from a blind A/B test of 50 textures shown at their closest in-game view: below 1.5x magnification 4x and 16x couldn't be told apart, between 1.5x and 3.3x it was a coin toss (and text sometimes looked worse at 16x), and from 3.3x on 16x was preferred 18 times out of 21 and never looked worse. They're `BOOST_MIN_MAG`, `BOOST_MIN_GAIN` and `BOOST_MAX_SIDE` at the top of `pcsx2_upscale.py`.
 - **Text detection:** OCR (RapidOCR with PP-OCRv4, Latin and Chinese) runs on each texture first. A texture counts as text when OCR reads at least 2 characters with confidence ≥ 0.5. On 229 hand-labelled dumps this gave 89% precision and 98% recall; the old "detected text area" approach peaked at about 63% / 81%. The rule favours recall because a general-purpose model tends to garble lettering, while a text-oriented model usually handles any texture well. It runs on the GPU at about 75 ms per texture.
+- **Material detail (optional):** with a `models/material.onnx` classifier (see [below](#material-detail-optional)), textures without text that it recognises as surfaces get the fine detail of a photographed material.
 - **Edges:** each texture is padded before upscaling. If its opposite edges match (repeating ground and wall textures), it's padded with them, so the upscale tiles without seams. Otherwise (gradients, shadows, UI bars) it's mirrored, so one edge doesn't bleed into the other.
 - **PS2 alpha:** transparency runs 0–128 on the PS2 (128 = opaque). It stays within each dump's own range:
   - near-uniform alpha is resized normally;
@@ -45,6 +47,8 @@ Put two 4x ONNX upscalers of your choice in `models/` (the file names are set at
 | `text.onnx` | textures with text |
 
 The OCR models are downloaded by `rapidocr` on first run.
+
+For material detail, also add `material.onnx` (optional, described below).
 
 In PCSX2, under **Settings → Graphics → Texture Replacement**:
 - **Dump Replaceable Textures:** turn on and play, to collect dumps.
@@ -73,6 +77,33 @@ replacements/pack/1a8dd21b75996f4a-8b1fe45826ac4020-00005194.dds
 On the next run those textures are skipped, and their existing replacements are deleted, including ones from downloaded packs.
 
 `recommended_skips.csv` lists textures worth skipping per game (serial, game, texture, what it is, why). Copy the `texture` column of your game's rows into its `skip.txt` to use them.
+
+## Material detail (optional)
+
+An upscaler can only guess at detail that was never in the dump. With a `models/material.onnx` classifier, the script also lays the fine detail of a real photographed material (see [materials/](materials/README.md)) over surface textures:
+
+| Family | Meant for | Photo |
+|---|---|---|
+| grain | asphalt, concrete, plaster, dirt | concrete |
+| stone | rock, bark | rock |
+| masonry | bricks, blocks | concrete (grain only) |
+| grass | grass, moss | grass |
+| wood | planks | wood |
+| metal | sheet metal | metal |
+
+- Only the photo's fine luminance detail is used, so colour, shading and layout stay the game's. It backs off on strong edges such as joints and painted lines.
+- Textures with text, cut-outs, flat or black textures, thin strips and textures under 32 px or over 512 px are never touched.
+- These surfaces are saved at up to 8x the dump (towards 1024 px on the short side), as the detail needs the room. Those that get the second pass stay at 16x.
+- It's a strong effect by design. Each family has one photo, so its features (cracks, plank lines) can be recognised across textures. Strengths are in `FAMILIES` at the top of `material.py`.
+- It applies to textures as they're upscaled. To add it to existing replacements made by this script, delete those and run again.
+- Without `models/material.onnx` the step is off.
+
+As with the upscalers, no classifier is included. Any ONNX image classifier with this interface works:
+
+- **Input:** `N x 3 x S x S` float32, RGB in 0–1 (S = 224 unless the model fixes another size). The N images are views of one texture: the texture itself and the texture repeated 2x2. Any normalisation belongs inside the model.
+- **Output:** `1 x 7` probabilities, in this order: not a surface, grain, stone, masonry, grass, wood, metal. Detail is added when "not a surface" is at most 0.5.
+
+It runs on the CPU.
 
 ## Texture usage (optional)
 
@@ -126,6 +157,8 @@ Without arguments it takes the two newest captures in `~/.config/PCSX2/videos/` 
 |---|---|
 | `pcsx2_upscale.py` | The whole flow: game selection, upscaling, writing replacements |
 | `textdet.py` | Text detection (OCR), decides which model a texture goes to |
+| `material.py` | Material detail: recognises surfaces, adds photographed detail |
+| `materials/` | The CC0 photos it uses |
 | `dds.py` | BC7 `.dds` writer with mipmaps, in the layout PCSX2's loader expects |
 | `texture_usage.py` | Texture usage sampling: indexes the textures, runs the session, prints the report |
 | `usage_agent.py` | Runs inside RenderDoc: launches PCSX2, captures frames, counts textures per frame |
