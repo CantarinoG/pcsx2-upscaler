@@ -82,26 +82,29 @@ On the next run those textures are skipped, and their existing replacements are 
 
 An upscaler can only guess at detail that was never in the dump. With a `models/material.onnx` classifier, the script also lays the fine detail of a real photographed material (see [materials/](materials/README.md)) over surface textures:
 
-| Family | Meant for | Photo |
+| Family | Meant for | Photos |
 |---|---|---|
-| grain | asphalt, concrete, plaster, dirt | concrete |
-| stone | rock, bark | rock |
-| masonry | bricks, blocks | concrete (grain only) |
-| grass | grass, moss | grass |
-| wood | planks | wood |
-| metal | sheet metal | metal |
+| asphalt | roads | 3 |
+| concrete | concrete, plaster, pavement | 3 |
+| dirt | soil, sand, gravel | 3 |
+| stone | rock, bark | 4 |
+| masonry | bricks, blocks (grain only) | 3 |
+| grass | grass, moss | 3 |
+| wood | wood grain | 3 |
+| metal | sheet metal, rust | 3 |
 
 - Only the photo's fine luminance detail is used, so colour, shading and layout stay the game's. It backs off on strong edges such as joints and painted lines.
 - Textures with text, cut-outs, flat or black textures, thin strips and textures under 32 px or over 512 px are never touched.
 - These surfaces are saved at up to 8x the dump (towards 1024 px on the short side), as the detail needs the room. Those that get the second pass stay at 16x.
-- It's a strong effect by design. Each family has one photo, so its features (cracks, plank lines) can be recognised across textures. Strengths are in `FAMILIES` at the top of `material.py`.
+- Each texture gets one of its family's photos, starting at its own offset, both derived from the texture's hash. So textures don't share a visible pattern, a rerun gives the same result, and palette variants of one texture get the same photo and offset.
+- It's a strong effect by design. Strengths are in `FAMILIES` at the top of `material.py`.
 - It applies to textures as they're upscaled. To add it to existing replacements made by this script, delete those and run again.
 - Without `models/material.onnx` the step is off.
 
 As with the upscalers, no classifier is included. Any ONNX image classifier with this interface works:
 
 - **Input:** `N x 3 x S x S` float32, RGB in 0–1 (S = 224 unless the model fixes another size). The N images are views of one texture: the texture itself and the texture repeated 2x2. Any normalisation belongs inside the model.
-- **Output:** `1 x 7` probabilities, in this order: not a surface, grain, stone, masonry, grass, wood, metal. Detail is added when "not a surface" is at most 0.5.
+- **Output:** `1 x 9` probabilities, in this order: not a surface, asphalt, concrete, dirt, stone, masonry, grass, wood, metal. Detail is added when "not a surface" is at most 0.5.
 
 It runs on the CPU.
 
@@ -151,6 +154,14 @@ A second list follows with the most magnified textures.
 
 Without arguments it takes the two newest captures in `~/.config/PCSX2/videos/` and works out which one is upscaled (the sharper one). It lines them up by their audio, so they can start a few frames apart, and stops if the replays drifted apart. The video is written next to the captures as `<game>_comparison.mp4`.
 
+## Tests
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+```
+
+They need no models, GPU or game: the models are replaced by stand-ins and the textures are generated.
+
 ## Files
 
 | File | Purpose |
@@ -163,5 +174,6 @@ Without arguments it takes the two newest captures in `~/.config/PCSX2/videos/` 
 | `texture_usage.py` | Texture usage sampling: indexes the textures, runs the session, prints the report |
 | `usage_agent.py` | Runs inside RenderDoc: launches PCSX2, captures frames, counts textures per frame |
 | `compare_video.py` | Comparison video from two captures of the same input recording |
+| `tests/` | Automated tests (see [Tests](#tests)) |
 | `plugins/` | Per-game rules (see [plugins/README.md](plugins/README.md)) |
 | `recommended_skips.csv` | Textures worth skipping, per game |

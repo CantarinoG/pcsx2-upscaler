@@ -580,7 +580,8 @@ def main():
                                           f"{(time.perf_counter() - t0) * 1000:.0f} ms")
                                     continue
                         if family := surfaces.get(src):
-                            up = detail.apply(up, im.size, family, edge_modes(np.asarray(im.convert("RGBA"))))
+                            up = detail.apply(up, im.size, family, edge_modes(np.asarray(im.convert("RGBA"))),
+                                              material.texture_key(src.stem))
                             note += f"  (+{family})"
                 except Exception as e:
                     failed += 1

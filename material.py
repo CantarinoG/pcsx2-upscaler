@@ -1,9 +1,12 @@
 """Add photographed material detail to upscaled surface textures (roads, walls, grass, rock, ...).
 
 An optional ONNX classifier (models/material.onnx, see README) says whether a texture is a surface and of which
-family. A surface gets the fine luminance detail of that family's photo (materials/) laid over its upscale. Colour,
-shading and layout stay the texture's own, and the detail backs off on strong edges such as joints and painted lines.
+family. A surface gets the fine luminance detail of one of that family's photos (materials/<family>/) laid over its
+upscale. Which photo, and where it starts, follows from the texture's own hash: textures differ from each other, but
+each gets the same result on every run. Colour, shading and layout stay the texture's own, and the detail backs off
+on strong edges such as joints and painted lines.
 """
+import hashlib
 from pathlib import Path
 
 import cv2
@@ -14,14 +17,16 @@ from PIL import Image
 import dds
 
 PHOTOS_DIR = Path(__file__).resolve().parent / "materials"
-# In the classifier's output order, after "not a surface": family -> (photo, fine log-luminance contrast added)
+# In the classifier's output order, after "not a surface": family -> fine log-luminance contrast added
 FAMILIES = {
-    "grain": ("concrete.jpg", 0.119),    # asphalt, concrete, plaster, dirt
-    "stone": ("rock.jpg", 0.168),        # rock and bark
-    "masonry": ("concrete.jpg", 0.112),  # bricks and blocks: only grain, their layout is the texture's
-    "grass": ("grass.jpg", 0.21),        # grass and moss
-    "wood": ("wood.jpg", 0.14),
-    "metal": ("metal.jpg", 0.098),
+    "asphalt": 0.119,
+    "concrete": 0.119,  # and plaster, pavement
+    "dirt": 0.119,      # soil, sand, gravel
+    "stone": 0.168,     # rock and bark
+    "masonry": 0.112,   # bricks and blocks: only grain, their layout is the texture's
+    "grass": 0.21,      # grass and moss
+    "wood": 0.14,
+    "metal": 0.098,
 }
 DIRECTIONAL = ("wood", "metal")  # the photo is turned to run the way the texture does
 SURFACE_MIN = 0.5                # probability of being a surface needed to add detail
@@ -46,9 +51,19 @@ def eligible(dump: Image.Image) -> bool:
     return bool(y.std() >= 2 and y.mean() >= 8 and not dds.is_cutout(rgba[..., 3]))
 
 
+def texture_key(name: str) -> str:
+    """The part of a dump's name that identifies its pixels, without palette and format: palette variants of a
+    texture must get identical grain, or it would flicker when a game switches between them."""
+    return name.split("-", 1)[0]
+
+
+def _seed(*parts: str) -> int:
+    return int.from_bytes(hashlib.sha1("/".join(parts).encode()).digest()[:8], "little")
+
+
 class MaterialClassifier:
-    """Input: N x 3 x S x S RGB in 0..1, N views of one texture. Output: 1 x 7 probabilities, "not a surface"
-    followed by FAMILIES."""
+    """Input: N x 3 x S x S RGB in 0..1, N views of one texture. Output: 1 x (1 + len(FAMILIES)) probabilities,
+    "not a surface" followed by FAMILIES."""
 
     def __init__(self, path: Path):
         self.sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
@@ -98,40 +113,57 @@ def _resize_tiling(img: Image.Image, size: tuple[int, int]) -> Image.Image:
     return around.resize(size, Image.Resampling.LANCZOS, box=(px, py, px + w, py + h))
 
 
-def _runs_vertically(a: np.ndarray) -> bool:
-    small = cv2.resize(a, (128, 128), interpolation=cv2.INTER_AREA)
+def _runs_vertically(a: np.ndarray, side: int = 128) -> bool:
+    small = cv2.resize(a, (side, side), interpolation=cv2.INTER_AREA)
     return bool(np.abs(np.diff(small, axis=1)).mean() > np.abs(np.diff(small, axis=0)).mean())
 
 
 class MaterialDetail:
     def __init__(self):
-        self.photos = {}
-        for name in {name for name, _ in FAMILIES.values()}:
-            with Image.open(PHOTOS_DIR / name) as im:
-                self.photos[name] = im.convert("L")
+        self.photos: dict[str, dict[str, Image.Image]] = {}
+        self.vertical: dict[tuple[str, str], bool] = {}  # which way each directional photo runs
+        for family in FAMILIES:
+            self.photos[family] = {}
+            for path in sorted((PHOTOS_DIR / family).glob("*.jpg")):
+                with Image.open(path) as im:
+                    photo = self.photos[family][path.stem] = im.convert("L")
+                if family in DIRECTIONAL:  # judged at 512: fine grain vanishes at 128
+                    self.vertical[family, path.stem] = _runs_vertically(np.asarray(photo, np.float32), 512)
+            if not self.photos[family]:
+                raise FileNotFoundError(f"no photos in {PHOTOS_DIR / family}")
 
-    def _photo(self, family: str, y: np.ndarray) -> np.ndarray:
-        """The family's photo covering y's size, repeated a whole number of times so tiling textures still tile."""
-        photo = self.photos[FAMILIES[family][0]]
-        if family in DIRECTIONAL and _runs_vertically(y) != _runs_vertically(np.asarray(photo, np.float32)):
+    def choose(self, family: str, key: str) -> str:
+        """The photo for a texture. Each photo bids with a hash, so adding one only moves textures onto that one."""
+        return max(self.photos[family], key=lambda name: _seed(key, name))
+
+    def _photo(self, family: str, y: np.ndarray, key: str) -> np.ndarray:
+        """The texture's photo covering y's size, repeated a whole number of times and shifted round the edges, so
+        tiling textures still tile."""
+        name = self.choose(family, key)
+        photo = self.photos[family][name]
+        if family in DIRECTIONAL and _runs_vertically(y) != self.vertical[family, name]:
             photo = photo.transpose(Image.Transpose.ROTATE_90)
         h, w = y.shape
         nx, ny = max(1, round(w / min(w, h))), max(1, round(h / min(w, h)))
         tile = _resize_tiling(photo, (round(w / nx), round(h / ny)))
-        covered = Image.fromarray(np.tile(np.asarray(tile), (ny, nx)))
+        shift = _seed(key, "offset")
+        rolled = np.roll(np.asarray(tile), (shift % tile.height, (shift >> 32) % tile.width), axis=(0, 1))
+        covered = Image.fromarray(np.tile(rolled, (ny, nx)))
         if covered.size != (w, h):
             covered = covered.resize((w, h), Image.Resampling.BICUBIC)
         return np.asarray(covered, np.float32)
 
-    def apply(self, up: Image.Image, dump_size: tuple[int, int], family: str, modes: tuple[str, str]) -> Image.Image:
-        """up: the upscale (4x, or 16x from the second pass). modes: the texture's edge padding, see edge_modes."""
+    def apply(self, up: Image.Image, dump_size: tuple[int, int], family: str, modes: tuple[str, str],
+              key: str) -> Image.Image:
+        """up: the upscale (4x, or 16x from the second pass). modes: the texture's edge padding, see edge_modes.
+        key: see texture_key."""
         sw, sh = dump_size
         scale = max(up.width // sw, output_scale(sw, sh))
         size = (sw * scale, sh * scale)
         rgb = np.asarray(up.convert("RGB").resize(size, Image.Resampling.BICUBIC), np.float32)
         y = rgb @ LUMA
 
-        photo = np.log(self._photo(family, y) + 8)
+        photo = np.log(self._photo(family, y, key) + 8)
         detail = photo - _blur(photo, scale * DETAIL_SIZE)
         detail = np.clip(detail / (detail.std() + 1e-5), -3, 3)
 
@@ -140,7 +172,7 @@ class MaterialDetail:
         edge = np.hypot(cv2.Scharr(soft, -1, 1, 0), cv2.Scharr(soft, -1, 0, 1))[1:-1, 1:-1] / 32 * scale
         keep = _blur(np.clip(1.4 - edge / 60, 0.3, 1), scale / 2, modes)
 
-        out = rgb * np.exp(detail * FAMILIES[family][1] * keep)[..., None]
+        out = rgb * np.exp(detail * FAMILIES[family] * keep)[..., None]
         out = np.clip(out + 0.5, 0, 255).astype(np.uint8)
         if "A" not in up.getbands():
             return Image.fromarray(out, "RGB")
