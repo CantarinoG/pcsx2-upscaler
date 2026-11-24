@@ -5,7 +5,8 @@ Record an input recording once (Tools -> Input Recording), replay it twice with 
 Load Texture Replacements off and once on. This script then:
   - picks the two newest captures in PCSX2's videos folder (or the two files given),
   - tells which one is upscaled (the sharper one),
-  - syncs them by their audio (the captures can start a few frames apart) and checks they don't drift,
+  - lines them up: roughly by their audio (the captures can start a few frames apart), then frame by frame by
+    the picture, since a stutter while capturing drops or repeats a frame in one of them,
   - renders a title card, then the whole replay with a divider sweeping across (original on the left, upscaled
     on the right), with the game's audio.
 
@@ -29,6 +30,9 @@ TITLE_SECONDS = 4.0
 FADE_SECONDS = 0.5                   # fades in and out of the title card
 WIPE_PERIOD = 8.0                    # seconds per full left-right-left sweep
 AUDIO_RATE = 8000
+THUMB = (64, 48)                     # frame size the captures are lined up at
+SEARCH = 15                          # frames either side of the audio's offset that the picture may be off by
+SWITCH_COST = 30.0                   # how sure the pictures must be before the offset moves (stutters)
 FONTS = ("/usr/share/fonts/opentype/inter/Inter-Bold.otf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 FONTS_REGULAR = ("/usr/share/fonts/opentype/inter/Inter-Regular.otf",
                  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
@@ -66,26 +70,78 @@ def xcorr(x: np.ndarray, y: np.ndarray) -> tuple[int, float]:
     return k - (len(y) - 1), float(c[k] / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-9))
 
 
-def sync(a: Path, b: Path, fps: float) -> tuple[int, int]:
-    """Frames to skip at the start of a and of b so they line up. Exits if they don't match or drift."""
+def audio_lag(a: Path, b: Path, fps: float) -> int:
+    """Rough lag in frames (b's frame n + lag shows a's frame n), from the audio. Exits if they don't match."""
     sa, sb = audio(a), audio(b)
-    lag, score = xcorr(sa, sb)
-    if score < 0.6:
-        sys.exit(f"The two captures don't sound alike (match {score:.2f}): are they replays of the same recording?")
-    lags = []
-    win = 5 * AUDIO_RATE
-    for t in range(0, len(sa) - win, 10 * AUDIO_RATE):  # same lag all along, or the replays drifted apart
+    lag, _ = xcorr(sa, sb)
+    # Judge the match on short windows: a stutter shifts one capture by a frame or two, which spoils the score
+    # over the whole length but not within a few seconds.
+    scores, win = [], 5 * AUDIO_RATE
+    for t in range(0, len(sa) - win, 10 * AUDIO_RATE):
         lo, hi = max(0, t - lag - AUDIO_RATE), min(len(sb), t - lag + win + AUDIO_RATE)
         if hi - lo >= win:
-            l, _ = xcorr(sb[lo:hi], sa[t:t + win])
-            lags.append(t - lo - l)
-    drift = (max(lags) - min(lags)) / AUDIO_RATE if lags else 0.0
-    if drift * fps > 1:
-        sys.exit(f"The replays drift apart by {drift:.2f}s: the input recording didn't replay identically.")
-    frames = round(-lag / AUDIO_RATE * fps)  # a[n] ~ b[n - lag]: b's content comes |lag| later when lag < 0
-    print(f"Synced: {'second' if frames > 0 else 'first'} capture starts {abs(frames)} frames later "
-          f"(audio match {score:.2f}, drift {drift * 1000:.0f} ms).")
-    return (0, frames) if frames >= 0 else (-frames, 0)
+            scores.append(xcorr(sb[lo:hi], sa[t:t + win])[1])
+    score = float(np.median(scores)) if scores else xcorr(sa, sb)[1]
+    if score < 0.6:
+        sys.exit(f"The two captures don't sound alike (match {score:.2f}): are they replays of the same recording?")
+    return round(-lag / AUDIO_RATE * fps)  # a[n] ~ b[n - lag]
+
+
+def thumbs(path: Path) -> np.ndarray:
+    raw = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-vf",
+                          f"scale={THUMB[0]}:{THUMB[1]},format=gray", "-fps_mode", "passthrough", "-f", "rawvideo",
+                          "-"], capture_output=True, check=True).stdout
+    return np.frombuffer(raw, np.uint8).reshape(-1, THUMB[1], THUMB[0]).astype(np.float32)
+
+
+def align(ta: np.ndarray, tb: np.ndarray, lag: int) -> np.ndarray:
+    """For each frame of a, the frame of b showing the same moment (-1 past b's end).
+
+    A stutter while capturing drops or repeats a frame in one capture, so the offset between them can change along
+    the way. Every offset within SEARCH frames of `lag` is scored per frame by how different the two pictures are,
+    and the cheapest path through them (Viterbi) is taken, paying SWITCH_COST per frame of change, so the offset
+    only moves where the pictures clearly say so."""
+    ks = np.arange(lag - SEARCH, lag + SEARCH + 1)
+    cost = np.full((len(ta), len(ks)), np.inf, np.float32)
+    for c, k in enumerate(ks):
+        lo, hi = max(0, -k), min(len(ta), len(tb) - k)
+        if hi > lo:
+            cost[lo:hi, c] = np.abs(ta[lo:hi] - tb[lo + k:hi + k]).mean((1, 2))
+    inside = np.isfinite(cost).all(1)
+    cost[~inside] = 0.0   # near either end, where some offsets run past a capture: no say, the offset carries on
+    n = len(ta)
+    step = SWITCH_COST * np.abs(ks[:, None] - ks[None, :])   # [from, to]
+    total, back = cost[0].copy(), np.zeros((n, len(ks)), np.int32)
+    for i in range(1, n):
+        t = total[:, None] + step
+        back[i] = t.argmin(0)
+        total = t[back[i], np.arange(len(ks))] + cost[i]
+    path = np.empty(n, np.int32)
+    path[-1] = int(total.argmin())
+    for i in range(n - 1, 0, -1):
+        path[i - 1] = back[i, path[i]]
+    if inside.any() and (path[inside].min() == 0 or path[inside].max() == len(ks) - 1):
+        sys.exit("The replays drift apart too far to line up: the input recording didn't replay identically.")
+    out = np.arange(n) + ks[path]
+    out[(out < 0) | (out >= len(tb))] = -1
+    return out
+
+
+def sync(a: Path, b: Path, fps: float) -> tuple[int, np.ndarray]:
+    """Frames of a to skip at the start, and for each following frame of a, the matching frame of b."""
+    lag = audio_lag(a, b, fps)
+    match = align(thumbs(a), thumbs(b), lag)
+    valid = match >= 0
+    skip = int(np.argmax(valid))                        # a starts before b: drop a's frames b has no match for
+    match = match[skip:]
+    end = len(match) if valid[skip:].all() else int(np.argmin(match >= 0))
+    match = match[:end]
+    jumps = [i for i in range(1, len(match)) if match[i] - match[i - 1] != 1]
+    where = ", ".join(f"{(skip + i) / fps // 60:.0f}:{(skip + i) / fps % 60:04.1f}" for i in jumps[:8])
+    print(f"Synced: offset {match[0] - skip:+d} frames" +
+          (f", re-aligned {len(jumps)} time(s) after stutters ({where}{', ...' if len(jumps) > 8 else ''})."
+           if jumps else ", steady."))
+    return skip, match
 
 
 def grab(path: Path, t: float, size=(VIEW_W, VIEW_H)) -> np.ndarray:
@@ -104,13 +160,21 @@ class Reader:
 
     def __init__(self, path: Path, skip: int, w: int, h: int):
         self.w, self.h = w, h
+        self.pos, self.last = -1, None   # index and picture of the last frame read
         # Every frame, in order (ffmpeg's trim filter drops frames on these captures); the first `skip` are discarded.
         self.proc = subprocess.Popen(["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-f", "rawvideo",
                                       "-pix_fmt", "rgb24", "-fps_mode", "passthrough", "-"], stdout=subprocess.PIPE)
         for _ in range(skip):
             self.read()
 
+    def frame(self, n: int) -> Image.Image | None:
+        """Frame n, for n that never goes back: frames in between are skipped, the same n again repeats it."""
+        while self.pos < n:
+            self.last = self.read()
+        return self.last
+
     def read(self) -> Image.Image | None:
+        self.pos += 1
         buf = self.proc.stdout.read(self.w * self.h * 3)
         if len(buf) < self.w * self.h * 3:
             return None
@@ -186,16 +250,15 @@ def main():
     if (pa["w"], pa["h"]) != (pb["w"], pb["h"]):
         sys.exit(f"The captures have different sizes ({pa['w']}x{pa['h']} vs {pb['w']}x{pb['h']}).")
     fps = pa["fps"]
-    skip_a, skip_b = sync(a, b, fps)
     if auto:  # the upscaled replay is the sharper one
         ts = [0.2, 0.4, 0.6, 0.8]
-        dur = min(pa["frames"] - skip_a, pb["frames"] - skip_b) / fps
-        sa = sum(sharpness(grab(a, skip_a / fps + f * dur)) for f in ts)
-        sb = sum(sharpness(grab(b, skip_b / fps + f * dur)) for f in ts)
+        sa = sum(sharpness(grab(a, f * pa["frames"] / fps)) for f in ts)
+        sb = sum(sharpness(grab(b, f * pb["frames"] / fps)) for f in ts)
         if sa > sb:
-            a, b, pa, pb, skip_a, skip_b = b, a, pb, pa, skip_b, skip_a
+            a, b, pa, pb = b, a, pb, pa
         print(f"Original: {a.name}\nUpscaled: {b.name}")
-    frames = min(pa["frames"] - skip_a, pb["frames"] - skip_b)
+    skip, match = sync(a, b, fps)
+    frames = len(match)
     seconds = frames / fps
     title = args.title or game_title(b)
     out = args.out or b.parent / f"{re.sub(r'[^A-Za-z0-9]+', '_', title).strip('_')}_comparison.mp4"
@@ -203,14 +266,14 @@ def main():
     title_frames = round(TITLE_SECONDS * fps)
     fade = round(FADE_SECONDS * fps)
     total = title_frames + frames
-    ra, rb = Reader(a, skip_a, pa["w"], pa["h"]), Reader(b, skip_b, pb["w"], pb["h"])
-    first_o, first_u = ra.read(), rb.read()
+    ra, rb = Reader(a, skip, pa["w"], pa["h"]), Reader(b, 0, pb["w"], pb["h"])
+    first_o, first_u = ra.read(), rb.frame(int(match[0]))
     card = title_card(first_u, title, "Original vs. upscaled textures")
 
     enc = subprocess.Popen(
         ["ffmpeg", "-nostdin", "-v", "error", "-y",
          "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{OUT_W}x{OUT_H}", "-r", pb["rate"], "-i", "-",
-         "-ss", f"{skip_b / fps:.4f}", "-i", str(b),
+         "-ss", f"{skip / fps:.4f}", "-i", str(a),   # the original's sound: its frames are all shown in order
          "-filter_complex",
          f"[1:a]atrim=duration={seconds:.3f},asetpts=PTS-STARTPTS,"
          f"afade=t=in:d=0.5,afade=t=out:st={max(0, seconds - 1.5):.3f}:d=1.5,"
@@ -231,7 +294,7 @@ def main():
             else:
                 i = n - title_frames
                 if i > 0:
-                    orig, up = ra.read(), rb.read()
+                    orig, up = ra.read(), rb.frame(int(match[i]))
                     if orig is None or up is None:
                         break
                 img = frame_wipe(orig, up, i / fps)

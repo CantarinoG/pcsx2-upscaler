@@ -192,7 +192,7 @@ A second list follows with the most magnified textures.
 .venv/bin/python compare_video.py [original.mp4 upscaled.mp4] [--out FILE] [--title TEXT]
 ```
 
-Without arguments it takes the two newest captures in `~/.config/PCSX2/videos/` and works out which one is upscaled (the sharper one). It lines them up by their audio, so they can start a few frames apart, and stops if the replays drifted apart. The video is written next to the captures as `<game>_comparison.mp4`.
+Without arguments it takes the two newest captures in `~/.config/PCSX2/videos/` and works out which one is upscaled (the sharper one). It lines them up roughly by their audio, so they can start a few frames apart, then frame by frame by the picture: a stutter while capturing drops or repeats a frame in one capture, and the upscaled capture skips or repeats a frame there to stay in step. It stops if the captures don't sound alike or drift too far apart (more than a quarter of a second). The sound is the original capture's. The video is written next to the captures as `<game>_comparison.mp4`.
 
 ## Tests
 
